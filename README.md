@@ -1,36 +1,35 @@
-# 平行线娱乐模块
+# 平行线多人聊天模块
 
-部署与接入材料项目。首个候选为 [Agnai](https://github.com/agnaistic/agnai)，完整保留其聊天界面、真人多人房间和 Bot 角色能力，不重新实现聊天前后端。
+基于官方 [Element Web](https://github.com/element-hq/element-web) 与 [Synapse](https://github.com/element-hq/synapse) 的独立部署项目，PostgreSQL 保存原生账号和聊天数据。完整使用上游聊天界面、房间、私聊、成员权限和加密流程，不重新实现聊天前后端。
 
-## 已确认的方向
+## 第一阶段
 
-- 前期可以独立部署、使用原生账号；主站统一登录、平台额度与 Chat 导航随后接入，不作为首次独立运行的前置条件。
-- 后期合并用户入口，不预设合并数据库、聊天引擎或上游界面。
-- 直接在生产环境运行与验收，不在本机启动应用、容器或业务测试。
-- 不替换现有 Chat，不复用其数据库、数据卷或密钥；不调用真实模型、不使用用户 Key 或账户余额。
-- 本项目先维护镜像锁、容器配置和恢复说明。上游缺失的功能不自动变为本项目的二次开发任务。
+- 网页入口：`https://tavern.pingxingxian.space`。
+- Homeserver：`https://matrix.pingxingxian.space`；身份形如 `@用户名:matrix.pingxingxian.space`，此身份域初始化后不能直接改名。
+- 使用原生独立账号和邀请码注册，保留 Element 原生布局、品牌、语言选择、主题、Labs 与设备验证。
+- 不接入 Bot、主站 SSO、模型 Key、平台余额或现有 Chat 导航，不全局关闭加密。
+- 不替换现有 Chat、主站、身份桥或模型网关，不复用它们的数据和密钥。
+- 按用户要求直接生产运行和验收，不在本机启动应用、构建或业务测试。
 
 ## 当前状态
 
-**部署准备中，尚未上线。** 已获授权创建公开仓库 `ixiaoyy/parallellines-entertainment`，并在主站 Actions 仅新增固定娱乐模块运维入口，不拿旧 Chat 发布参数创建本模块。实际部署结果另记回执，不以材料存在代替上线。
+**官方镜像及静态配方已准备，尚未完成生产部署验收。** 镜像锁只记录公开 Registry 与源码证据，不能证明账号注册、房间消息或设备恢复可用。实际发布、TLS 和双账号结果应另记生产回执。
 
-已执行的只读生产检查：
+用户已授权维护公开仓库 `ixiaoyy/parallellines-entertainment`，并在主站 Actions 仅增加固定娱乐模块运维入口，复用现有连接，不读取或复制 Secrets。不能拿旧 Chat 的发布参数创建本模块。
 
-- [Chat 健康盘点](https://github.com/ixiaoyy/ParallelLines/actions/runs/44058459636)：现有 Chat 为 `healthy`，未修改服务。
-- [独立资源和证书盘点](https://github.com/ixiaoyy/ParallelLines/actions/runs/44061888708)：完成。目标机 4 个 CPU，系统盘剩余约 49.8 GiB，`/data` 剩余约 1.91 TiB；该通道不提供可用内存，不能据此承诺新模块容量。
-- 圈子旧盘点因 `api_command_requires_review` 拒绝继续；未放宽其检查、修复其他服务或将失败当成资源检查通过。
+## 文件
 
-## 文件与边界
+| 文件 | 职责 |
+| --- | --- |
+| `upstream.lock.json` | 官方组件版本、源码提交、不可变镜像及核对层级 |
+| `compose.yaml` | 独立 Element、Synapse、PostgreSQL；应用仅映射服务器回环，数据库无宿主端口 |
+| `config/element.json` | 仅指定本实例 homeserver，不覆盖其他产品设置 |
+| `config/synapse-public.yaml` | 必要原生非秘密配置；由发布流程合并到官方生成的完整运行配置 |
+| `docs/OPERATIONS.md` | 原生生成、私有配置、生产验收与停止恢复契约 |
+| `NOTICE.md` | 上游来源和许可证说明 |
 
-- `upstream.lock.json`：上游提交与不可变镜像引用。
-- `compose.yaml`：独立 app、MongoDB、Redis；应用只绑定服务器回环，数据库不开放宿主端口。
-- `docs/OPERATIONS.md`：发布前置、首次启动、验收和停止恢复边界。
-- `NOTICE.md`：上游来源与许可证说明。
+生产根固定为 `/data/services/parallellines-entertainment`。所有运行凭据、signing key、媒体和数据库均留在其私有 `runtime/` / `data/` 内，不能随源码发布。
 
-公开域名已确认为 `tavern.pingxingxian.space`，DNS 由用户添加，证书仍须通过生产发布申请并核实。不能把服务器回环端口视为已向用户开放。首版保留原生账号，不配置全局供应商凭据，不接平台余额。Agnai 在固定版本中没有核到可靠的关闭注册与匿名访问配置，不能宣称已有邀请制或统一主站登录。
+## 后续边界
 
-## 后续接入
-
-保留现有主站身份桥与 New API。新模块若要接入统一账号或免填 Key 使用平台额度，需要单独的客户端及授权适配，不能冒用 Open WebUI 的 OAuth 客户端，也不能通过链接传递 token 或 Key。
-
-原生多人生成使用房主的模型配置和 Key，不是发言者各自付费。第一阶段不改写这条行为；真实模型与费用验收另行授权。
+现有 Chat 继续提供原有能力。本阶段不预做接入层或保留未使用的功能分支；后续若要统一入口、账号或加入 Bot，应按具体需求另核原生接口和授权，不重写房间与消息系统。

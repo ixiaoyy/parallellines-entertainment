@@ -1,77 +1,99 @@
-# 独立部署与恢复
+# 原生部署与恢复
 
-## 1. 当前授权和实际状态
+## 1. 范围与状态
 
-用户已确认新建项目、前期独立部署，明确要求直接生产运行，不做本地试用。第一阶段使用 Agnai 原生账号，不以统一主站登录或平台额度为首次启动条件。
+用户已选定 Matrix + Element，并确认两个域名、原生邀请码注册。第一阶段不修改产品界面、主题、品牌、翻译、Labs、设备验证或其他原生交互；不接 Bot、SSO、Key、平台余额或 Chat 导航，不全局关闭加密。
 
-用户已授权创建公开仓库 `ixiaoyy/parallellines-entertainment`、提交推送本次新项目，以及主站仅新增的两份固定娱乐运维文件。生产域名确认为 `tavern.pingxingxian.space`。本项目初始材料只代表镜像与静态配置准备；服务、入口与实际验收结果另记回执，不把材料存在当成已上线。
+按用户要求直接在生产运行，不在本机启动应用、构建、执行 Compose 校验或业务测试。本文件与镜像锁目前是准备材料，不能代替生产健康、真实账号、房间消息或设备恢复结果。
 
-## 2. 固定组件与调用链
+生产固定边界：
 
-`tavern.pingxingxian.space → Agnai app → 本项目 MongoDB / Redis`
+| 对象 | 值 |
+| --- | --- |
+| 项目根 | `/data/services/parallellines-entertainment` |
+| Compose project | `parallellines-entertainment` |
+| Element 网页 | `https://tavern.pingxingxian.space` |
+| Synapse 公网基址 | `https://matrix.pingxingxian.space/` |
+| Synapse `server_name` | `matrix.pingxingxian.space`，初始化后不能直接改名 |
+| 回环端口 | Element `127.0.0.1:13101`；Synapse `127.0.0.1:13102` |
 
-- 镜像与完整上游提交见 `upstream.lock.json`；三个镜像均只读核对过 `linux/amd64`。
-- MongoDB 保存原生账号、房间和共享聊天；Redis 负责消息总线，不持久保存聊天。
-- 原生模型调用使用房主配置。无真实 Key / 模型调用授权，不配置共享模型 Key，不自动接现有账户额度。
-- 应用回环端口暂定为 `127.0.0.1:13101`，发布前必须在目标服务器确认未占用；不能仅根据本机端口情况判断。
-- 数据卷由独立 Compose project `parallellines-entertainment` 创建。不得引用既有 Chat、主站、身份桥或 New API 的存储卷和密钥。
+## 2. 固定组件与数据
 
-## 3. 发布前置
+`浏览器 → Element 原生页面 → Synapse 原生 Client API → 本项目 PostgreSQL / 媒体目录`
 
-### 生产连接和发布权限
+- `upstream.lock.json` 为三镜像版本依据，均已只读核对 `linux/amd64`；正式发布仍须核目标机架构、Compose 版本、端口与资源。
+- Element 为官方静态客户端；只覆盖必要的 homeserver URL 和 server name。其 `/app/config.json` 为公开非秘密配置，宿主文件可用 0644；不要覆盖官方默认用户或入口。
+- Synapse 为单进程原生 homeserver，`./data/synapse` 挂到 `/data`，保存完整私有配置、signing key 和媒体。无须部署 worker 或额外消息总线。
+- PostgreSQL 17 的 `./data/postgres` 挂到 `/var/lib/postgresql/data`，只在本项目内部网提供连接，不映射宿主端口。
+- Compose 的三服务内存上限合计约 2.125 GiB，仅是隔离上限，不是官方最低要求或容量保证；发布前须给现有服务保留余量。
+- 三镜像所选平台压缩层合计 354,369,877 字节，不等于解压后、可写层和数据空间需求。
 
-现有 `chat-ops` 仅接受固定 Open WebUI 服务，不能通过修改旧版本参数或下载内容发布新模块。需要在现有主站 Actions 连接下新增固定娱乐模块发布操作；保留当前 Secrets 及固定主机指纹，不导出或复制凭据。
+不连接、迁移或初始化现有 Chat、主站、身份桥和模型网关的数据。数据库 schema 由新实例的官方 Synapse 原生初始化管理，不增加自定义表或应用补丁。
 
-新入口只接受固定操作枚举，不接受任意 shell、路径、域名、配置正文或来源提交。只读健康通道不等待写锁；写操作沿现有 `deploy-production` 互斥组。主站文件限定为 `.github/workflows/entertainment-ops.yml` 和 `.github/scripts/entertainment_ops.py`，其他未提交改动不纳入本次发布。
+## 3. 首次 prepare 消费者契约
 
-### 宿主资源
+以下操作只在生产项目私有目录中执行，由固定发布通道负责；不能直接用缺少私有运行文件的根 Compose 启动。
 
-已有只读盘点确认 CPU 和磁盘，但没有可用内存。发布前还需确认架构、Docker Compose 版本、目标端口、内存余量及本项目不存在同名运行实例。三个容器的配置内存上限合计约 2.125 GiB；这不是官方最低要求或负载保证，必须给现有服务保留余量。
+1. 确认本项目目录、端口、容器和网络没有陌生前像；为本次部署保存身份、资源和现有服务健康记录。不能覆盖已有目录或复用其他系统的数据。
+2. 在生产主机拉取镜像锁中的三个不可变引用。先创建本项目 `runtime/`、`data/synapse/` 和 `data/postgres/`，拒绝软链或目录逃逸；`create_host_path: false` 防止 Compose 自动生成错误挂载路径。
+3. 只在私有 `runtime/postgres-password` 生成一个独立随机数据库口令，目录 0700、文件 root 所有且 0600，不打印、不提交、不使用示例秘密。PostgreSQL 使用官方 `POSTGRES_PASSWORD_FILE` 原生入口读取；不要改成明文 Compose 环境或覆盖官方入口/默认用户。
+4. 用固定 Synapse 镜像的官方 `generate` 模式初始化新的 `data/synapse`：设置 `SYNAPSE_SERVER_NAME=matrix.pingxingxian.space`、`SYNAPSE_REPORT_STATS=no`，挂载到 `/data`。官方入口生成 `homeserver.yaml`、日志配置和 signing key；默认服务 UID/GID 为 `991:991`。
+5. 读取本项目 `config/synapse-public.yaml`，以顶层字段合并到新生成的完整配置，再把刚生成的数据库口令仅写入最终私有配置的 `database.args.password`。公开文件本身没有假口令，也不是可单独启动的完整配置。
+6. 保留官方生成的所有其他字段和秘密，包括 signing key、macaroon/form/注册共享秘密及其实际路径；不重置、复制、向日志展开或替换为其他项目值。最终私有配置须可由 UID 991 读取，数据目录可由其写入；对宿主无关用户保持不可访问。
+7. PostgreSQL 只在全新数据目录执行原生初始化。`POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C` 为 Synapse 必需条件；不使用 `allow_unsafe_locale` 或不安全密码认证绕过。
+8. 首次生成完成后记录私有准备回执。后续 prepare 不得重新生成 signing key、替换数据库密码或再次初始化已有数据；未知前像停止，由操作者核对。
 
-三镜像所选平台的压缩层合计 974,791,018 字节，不等于解压后磁盘需求。准备阶段须在生产主机重新检查镜像和数据盘空间。
+`config/synapse-public.yaml` 仅设置域名、公网基址、容器内反代 listener、PostgreSQL 连接非秘密字段和邀请码注册。Listener 保留原生 `client / federation` 资源语义，没有加入全局联邦黑白名单。是否开放额外联邦委派或端口由实际入口范围确定，不能把未验收的跨服务器聊天列为首版完成能力。
 
-### 私有运行配置
+## 4. 原生账号与邀请码
 
-只在已确认的生产项目根内创建 `runtime/agnai.env`，目录 0700、文件 0600，至少包含：
+- 使用 `enable_registration: true` 和 `registration_requires_token: true`，保持 `enable_registration_without_verification` 默认 false；不开放无验证注册。
+- 初始管理员通过 Synapse 原生 `register_new_matrix_user` 或原生共享秘密注册接口创建，凭据只留服务器私有记录；不得在命令日志或交付材料中输出口令、共享秘密和管理员 token。
+- 注册邀请码由 Synapse 原生 Registration Tokens Admin API 管理；Element 使用原生注册验证步骤，不编写新注册页面。邀请码的实际用途次数和有效期须在发放时明确，不在公开仓库保存真实令牌。
+- 保留 Element 原生设备验证与加密恢复流程。新浏览器可能要求已有设备或恢复密钥验证，不用关闭 `force_verification` 来跳过验收。
 
-- `JWT_SECRET`：为本模块独立生成并长期保留；原生 Provider Key 加密也依赖它。
-- `INITIAL_USER`、`INITIAL_PASSWORD`：独立管理员，使用随机初始口令，不使用上游示例值。
+## 5. 生产发布与公网入口
 
-该文件不写进 Git、发布包、Actions 输出或交付记录。不得设置 `RESET_PASSWORD`，也不设置 `CLUSTERING`、`PUBLIC_TUNNEL`、`PIPELINE_PROXY`；这些原生布尔开关按非空值判断，字符串 `false` 也不能用来表达关闭。
+既有发布通道只操作各自固定服务，本模块使用主站仅新增的 `.github/workflows/entertainment-ops.yml` 和 `.github/scripts/entertainment_ops.py`。只接受固定操作和已审核来源，不提供任意 shell、路径、域名或配置正文参数。现有 Actions Secrets 和主机指纹保留在所属通道，不复制到本仓库。
 
-`LOG_LEVEL=warn` 已从固定源码确认会抑制初始管理员的 info 日志，但不代表所有 warning/error 都自动脱敏。不要输出完整启动日志、`docker inspect .Config.Env` 或展开的 Compose 环境；诊断只读取有界、审查过的状态字段。
+首次启动只处理本项目的 `element / synapse / postgres`。公开入口通过本项目独立 edge overlay 将两个新服务加入现有网关已经连接的网络，不改变旧网关的网络或默认路由，不重建现有服务。
 
-### 公开入口
+两个域名与证书必须分别真实核对。Element 和 homeserver 使用不同 origin；不把 Client API、媒体 API 或 `/_synapse/admin/` 转发到静态客户端。公网反代使用固定真实 upstream，保留规范化前的 Matrix 路径、查询串和 Authorization；代理需按官方文档传递 Host、X-Forwarded-For 与 X-Forwarded-Proto。管理员 API 仅留独立运维路径，不默认向公网发布。
 
-生产域名为 `tavern.pingxingxian.space`。用户已添加 DNS，实际发布仍须核对解析、原站路由和 HTTP 验证路径。现有盘点证书未覆盖新的娱乐域名，不得将旧证书直接用于未覆盖的名称。
+生产盘点确认根 Nginx 会加载 `/etc/nginx/conf.d/*.conf`，但没有整个目录的持久挂载。优先新增本模块独立配置，不修改 `default.conf` 或圈子已有配置；`nginx -t` 通过后才 reload，不重建共享网关。旧服务的配置和证书续期守卫不能因本模块被放宽或悄悄失效。
 
-Agnai 的 API 与 WebSocket 以 origin 根路径运行，优先使用独立子域名，不把应用挂在 `/entertainment/agnai/` 下再靠字符串替换补救。
+当前独立配置只能保留到网关容器被重建前；容器 restart 不会丢失，但 recreate 会丢失。首次公网开放前须明确接受这一阶段边界，保存服务器侧配置源与固定重发布恢复操作，不能宣称已有跨网关重建的持久挂载。如果要求现在增加持久挂载并重建网关，必须另行批准共享网关及旧续期记录的配套变更。新证书续期与 reload 仍需验证，签发成功不等于续期已接通。
 
-首版保留原生账号、注册和访客入口，不增加自研登录界面或另一套认证平台；不设置全局供应商 Key，不提供匿名共享模型，也不自动接入现有账户额度。固定源码没有核到可靠的关闭注册或匿名入口开关，不能将此部署称为邀请制试用。不要简单套整站 Basic Auth：它可能与原生 API 的 Bearer 认证争用 `Authorization`。只有真实完成 TLS 与入口验收后，才能报告已向用户开放。
+本阶段不另部署 TURN、MatrixRTC 或其他音视频服务，也不修改界面隐藏按钮。未配置或验收的音视频、联邦功能不作为上线承诺。
 
-## 4. 在生产环境验收
+## 6. 真实验收与日志
 
-不在本机运行应用、容器、构建或业务测试。生产操作按阶段完成，不压测、不故障注入、不使用真实 Key 或余额。
+仅在生产授权范围内做低负载真实入口检查，不压测、不故障注入、不调用模型或产生费用。
 
-1. 固定发布操作校验实际镜像、目录和端口，再创建全新私有配置与本项目卷；先只启动三个新服务。
-2. 独立读取 `GET /healthcheck`，要求 HTTP 200 且 `status / db / redis` 均为 `true`。该路由只确认初始化连接，不能代替业务读写、消息同步或模型验收；不得使用它的 `sleep` 参数。
-3. 核现有 Chat、主站及网关健康，确认没有重建其他服务。未授权入口变更前不动现有 Nginx。
-4. 公网入口前置满足后，检查 TLS、静态资源和 WebSocket；如需网关配置改动，先保留当前前像和备份，再定向新增、执行 `nginx -t`，通过后才 reload，不整份覆盖配置或重建主站。
-5. 用本模块两个明确的验收账号走原生注册/邀请/成员加入、真人消息、角色选择、刷新及断线恢复，保存实际截图与结果。不得在既有 Chat 或主站生成测试业务数据。
-6. 模型回复、房主付款和 Key 隔离是独立验收项；没有模型调用授权时保留未验收状态，不能以角色名称显示成功代替。
+1. PostgreSQL 原生 `pg_isready` 就绪后启动 Synapse；核对新数据库的 UTF8、C locale 和原生 schema 初始化，不连接其他数据库。
+2. Element 保留官方镜像 healthcheck `/config.json`；Synapse 保留官方镜像 healthcheck `/health`。这两者不能代替数据库、跨域或聊天验收。
+3. 独立读取 `/_matrix/client/versions` 与原生登录/注册能力，核 HTTPS、Element 配置中的 homeserver、CORS 和两个域的路由；真实页面可加载不等于已经能聊天。
+4. 用本实例两个验收账号走原生邀请码注册、登录、设备验证、创建房间、邀请/加入、双方发收消息、刷新后历史、退出与恢复，记录实际页面截图和结果。不得在既有系统造业务数据。
+5. 核现有 Chat、主站、身份桥和模型网关的服务身份及健康没有被本次改变，再记录本次真实发布范围与未验收项。
 
-## 5. 停止与恢复
+不输出完整 Compose 环境、容器环境、私有配置、数据库口令、signing key、注册共享秘密、邀请码、用户或管理员 token。不启用 `SYNAPSE_LOG_SENSITIVE` / `SYNAPSE_LOG_TESTING`，不把 SQL 日志升至 DEBUG；必要错误只收集有界、审查过的状态和稳定错误码。
 
-首次启动前准备独立 `health` 和 `stop` 操作。它们只识别本项目身份和固定 Compose 来源，不受公开入口故障影响。
+## 7. 停止、备份与恢复
 
-- 新模块启动失败：仅停止本项目服务，保留数据卷、私有配置和诊断回执，不自动改镜像、删库或覆盖旧服务。
-- 已对外开放后需撤回：只撤回本模块新增入口并核网关健康，再停止本项目；不能停止或恢复整套主站配置。
-- 确认运行目录及项目归属后，可在该目录用 `docker compose --project-name parallellines-entertainment --file compose.yaml stop` 停止本项目。严禁 `down -v` 或全局 prune。
-- 应用升级前保留旧镜像、Compose、稳定密钥及原生数据库的一致备份。不能只恢复旧数据库抹掉后续写入，也不能默认任意旧镜像都兼容新数据。
-- 换镜像或补丁属于后续发布，不能以首次部署授权长期更新镜像。
+网关变更前必须已有独立 `health / stop` 操作，既有入口异常时仍能使用。
 
-## 6. 后续平台接入
+- 启动失败仅停止本项目服务，保留 `runtime/`、`data/synapse/`、`data/postgres/` 和回执，不删库、不换密码、不重新生成 signing key。
+- 对外开放后撤回，仅处理本模块新增入口及本次附加网络，核网关健康后停止本项目；不恢复或重建整套主站。
+- 在固定生产根确认归属后，可用 `docker compose --project-name parallellines-entertainment --file compose.yaml stop` 停止本项目。严禁 `down -v`、全局 prune 或任何其他服务停止。
+- 升级前保留旧镜像、Compose、Element 配置、完整 Synapse 私有配置与 signing key、媒体和 PostgreSQL 一致备份；数据库备份使用 PostgreSQL 支持的方式，不能把运行中的目录拷贝冒充一致备份。
+- 不自动回灌旧数据库抹掉后续消息或账号，不默认旧镜像兼容新 schema。恢复需明确目标版本与数据兼容性；后续镜像升级不沿用首次部署授权。
 
-第一阶段独立账号是明确接受的边界，不伪装成已统一登录。后续按需要接入主站身份桥、New API 与 Chat 导航；每项先检查原生接口和所有调用方，再列具体适配范围。Chat 的既有 `parallellines-openwebui` audience 不能直接给新应用使用。
+## 官方依据
 
-后期收拢入口不意味着迁移房间数据库、复制 Key 或重写上游界面。若某项玩法需要重构房间、角色或聊天核心，先重新评估底座，不自动实施。
+- [Synapse Docker 生成与启动](https://github.com/element-hq/synapse/blob/v1.165.0/docker/README.md)
+- [Synapse PostgreSQL 与 locale](https://element-hq.github.io/synapse/latest/postgres.html)
+- [Synapse 配置](https://github.com/element-hq/synapse/blob/v1.165.0/docs/usage/configuration/config_documentation.md)
+- [邀请码 Admin API](https://github.com/element-hq/synapse/blob/v1.165.0/docs/usage/administration/admin_api/registration_tokens.md)
+- [Synapse 反代与健康](https://github.com/element-hq/synapse/blob/v1.165.0/docs/reverse_proxy.md)
+- [Element 配置](https://github.com/element-hq/element-web/blob/v1.12.35/docs/config.md)
+- [PostgreSQL 官方容器](https://hub.docker.com/_/postgres)

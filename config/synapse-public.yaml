@@ -1,0 +1,29 @@
+# 仅包含本次确认的原生非秘密设置；不得把本文件直接作为完整运行配置。
+# 发布操作先运行官方 generate，再合并这些字段并补入服务器私有数据库口令。
+server_name: matrix.pingxingxian.space
+public_baseurl: https://matrix.pingxingxian.space/
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: true
+    # 容器内不能绑定宿主回环；宿主端口由 Compose 限制为 127.0.0.1。
+    bind_addresses: ["0.0.0.0"]
+    resources:
+      - names: [client, federation]
+        compress: false
+
+database:
+  name: psycopg2
+  args:
+    user: synapse
+    dbname: synapse
+    host: postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+# 使用 Synapse 原生邀请码验证；不启用无验证的公开注册。
+enable_registration: true
+registration_requires_token: true

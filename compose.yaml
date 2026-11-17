@@ -1,97 +1,85 @@
 name: parallellines-entertainment
 
 services:
-  app:
-    image: ghcr.io/agnaistic/agnaistic:fccee00f5f7628d150760c787c4be87e6b1a652c@sha256:3afcf7f92eac3bdb335bb4a85bb91a86fcad6a953b5eeceb2a722c62726af0c1
+  element:
+    image: ghcr.io/element-hq/element-web:v1.12.35@sha256:406b48b80153818284a235fa3600b2a5b5b6b0aa0e4ef4896b36d8d3461352f3
     platform: linux/amd64
     restart: unless-stopped
-    # 仅由正式发布在服务器私有目录生成，不在本机创建真实凭据。
-    env_file:
-      - ./runtime/agnai.env
-    environment:
-      NODE_ENV: production
-      SELF_HOST: "1"
-      APP_HOST: 0.0.0.0
-      PORT: "3001"
-      DB_HOST: mongo
-      DB_PORT: "27017"
-      DB_NAME: parallellines_entertainment
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      ASSET_FOLDER: /app/dist/assets
-      # 上游首次创建管理员会将初始口令写入 info；该等级抑制这条日志。
-      LOG_LEVEL: warn
-    ports:
-      - "127.0.0.1:13101:3001"
+    # 只指定本实例的 homeserver；主题、品牌、语言和验证流程沿用原生产品。
     volumes:
-      - app-db:/app/db
-      - app-assets:/app/assets
-      - app-dist-assets:/app/dist/assets
-      - app-extras:/app/extras
+      - type: bind
+        source: ./config/element.json
+        target: /app/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:13101:80"
     networks:
       default: {}
-      backend: {}
-    depends_on:
-      mongo:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    # 这是隔离上限，不是容量保证；发布前仍须检查宿主可用内存。
-    mem_limit: 1g
-    cpus: "1.0"
+    # 这是隔离上限，不是容量保证；实际资源须在生产发布前核对。
+    mem_limit: 128m
+    cpus: "0.5"
     logging: &bounded_logs
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    healthcheck:
-      # 原生健康同时确认 app、MongoDB、Redis 的连接状态，不调用模型。
-      test:
-        - CMD
-        - node
-        - -e
-        - >-
-          const http=require('http');const r=http.get('http://127.0.0.1:3001/healthcheck',s=>{let b='';s.on('data',x=>{b+=x;if(b.length>65536)r.destroy();});s.on('error',()=>process.exit(1));s.on('end',()=>{try{const j=JSON.parse(b);process.exit(s.statusCode===200&&j.status===true&&j.db===true&&j.redis===true?0:1);}catch{process.exit(1);}});});r.setTimeout(5000,()=>r.destroy());r.on('error',()=>process.exit(1));
-      interval: 20s
-      timeout: 8s
-      start_period: 90s
-      retries: 6
 
-  mongo:
-    image: mongo:8@sha256:05b334b0a7a78fe913caac0cd2e1ecccf4da515d9a3a44be911b6ea3734c17cd
+  synapse:
+    image: ghcr.io/element-hq/synapse:v1.165.0@sha256:673b4223c81a7634fd07d832b939a58f97081cfdaae7cdd2d1664cdcf7611b62
     platform: linux/amd64
     restart: unless-stopped
-    # 只连接本项目私网；没有宿主端口，不共享任何既有数据库。
-    networks:
-      - backend
+    environment:
+      SYNAPSE_CONFIG_PATH: /data/homeserver.yaml
+    # 该目录须先由官方 generate 创建，再按运维契约合并公开配置和私有口令。
     volumes:
-      - mongo-data:/data/db
-      - mongo-config:/data/configdb
+      - type: bind
+        source: ./data/synapse
+        target: /data
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:13102:8008"
+    networks:
+      default: {}
+      backend: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 1g
+    cpus: "1.0"
+    logging: *bounded_logs
+
+  postgres:
+    image: postgres:17@sha256:0d938e975177bef9f1f61f3f9dbcf2e0aa0a139568f66d3415ed8892eb97f6ac
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: synapse
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+      # Synapse 原生要求 UTF8 与 C locale，不使用不安全 locale 绕过配置。
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+    secrets:
+      - postgres-password
+    volumes:
+      - type: bind
+        source: ./data/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    # 数据库只连接本项目私网，不映射宿主端口。
+    networks:
+      backend: {}
     mem_limit: 1g
     cpus: "1.0"
     logging: *bounded_logs
     healthcheck:
-      test: [CMD, mongosh, --quiet, --host, "127.0.0.1", --port, "27017", --eval, "quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)"]
-      interval: 10s
-      timeout: 8s
-      start_period: 45s
-      retries: 12
-
-  redis:
-    image: redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
-    platform: linux/amd64
-    restart: unless-stopped
-    # 仅承担原生消息总线；聊天和账号持久化由 MongoDB 负责。
-    command: [redis-server, --save, "", --appendonly, "no"]
-    networks:
-      - backend
-    mem_limit: 128m
-    cpus: "0.5"
-    logging: *bounded_logs
-    healthcheck:
-      test: [CMD, redis-cli, ping]
+      test: [CMD, pg_isready, -U, synapse, -d, synapse]
       interval: 10s
       timeout: 5s
+      start_period: 30s
       retries: 12
 
 networks:
@@ -99,10 +87,6 @@ networks:
   backend:
     internal: true
 
-volumes:
-  mongo-data: {}
-  mongo-config: {}
-  app-db: {}
-  app-assets: {}
-  app-dist-assets: {}
-  app-extras: {}
+secrets:
+  postgres-password:
+    file: ./runtime/postgres-password
