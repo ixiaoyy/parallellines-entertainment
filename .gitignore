@@ -1,0 +1,14 @@
+# 私有运行配置、数据与发布回执不能进入 Git。
+runtime/
+data/
+.deployment/
+.env
+.env.*
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# 本项目不在本机安装或运行上游应用。
+node_modules/
+__pycache__/

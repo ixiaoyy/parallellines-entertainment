@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "status": "prepared-not-deployed",
+  "verified_date": "2026-11-17",
+  "application": {
+    "name": "Agnai",
+    "repository": "https://github.com/agnaistic/agnai",
+    "revision": "fccee00f5f7628d150760c787c4be87e6b1a652c",
+    "source_url": "https://github.com/agnaistic/agnai/tree/fccee00f5f7628d150760c787c4be87e6b1a652c",
+    "license": "AGPL-3.0",
+    "image": "ghcr.io/agnaistic/agnaistic:fccee00f5f7628d150760c787c4be87e6b1a652c@sha256:3afcf7f92eac3bdb335bb4a85bb91a86fcad6a953b5eeceb2a722c62726af0c1",
+    "platform": "linux/amd64",
+    "compressed_layer_bytes": 652733263
+  },
+  "dependencies": {
+    "mongo": {
+      "image": "mongo:8@sha256:05b334b0a7a78fe913caac0cd2e1ecccf4da515d9a3a44be911b6ea3734c17cd",
+      "platform": "linux/amd64",
+      "platform_manifest_digest": "sha256:95d3cbd18ab8b9a49f425668449b05d140c9a54e341e5c93885ae876823388d3",
+      "compressed_layer_bytes": 305643082
+    },
+    "redis": {
+      "image": "redis:7-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe",
+      "platform": "linux/amd64",
+      "platform_manifest_digest": "sha256:e4ee3e03ce8f75471f40937a7c6b2b0e500390b6812fcdf5cb32c01295ded446",
+      "compressed_layer_bytes": 16414673
+    }
+  },
+  "validation": {
+    "registry_manifests_and_platforms": "verified-read-only",
+    "production_startup": "not-run",
+    "two_user_native_flow": "not-run",
+    "websocket_and_reconnect": "not-run",
+    "real_model_or_billing": "not-authorized"
+  }
+}
