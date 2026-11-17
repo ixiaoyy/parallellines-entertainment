@@ -4,7 +4,7 @@
 
 用户已选定 Matrix + Element，并确认两个域名、原生邀请码注册。第一阶段不修改产品界面、主题、品牌、翻译、Labs、设备验证或其他原生交互；不接 Bot、SSO、Key、平台余额或 Chat 导航，不全局关闭加密。
 
-按用户要求直接在生产运行，不在本机启动应用、构建、执行 Compose 校验或业务测试。本文件与镜像锁目前是准备材料，不能代替生产健康、真实账号、房间消息或设备恢复结果。
+按用户要求直接在生产运行，不在本机启动应用、构建、执行 Compose 校验或业务测试。站点已发布，实际检查结果见 `DEPLOYMENT-20261117.md`；本文件与镜像锁不能代替真实账号、房间消息或设备恢复验收。
 
 生产固定边界：
 
@@ -62,7 +62,24 @@
 
 生产盘点确认根 Nginx 会加载 `/etc/nginx/conf.d/*.conf`，但没有整个目录的持久挂载。优先新增本模块独立配置，不修改 `default.conf` 或圈子已有配置；`nginx -t` 通过后才 reload，不重建共享网关。旧服务的配置和证书续期守卫不能因本模块被放宽或悄悄失效。
 
-当前独立配置只能保留到网关容器被重建前；容器 restart 不会丢失，但 recreate 会丢失。首次公网开放前须明确接受这一阶段边界，保存服务器侧配置源与固定重发布恢复操作，不能宣称已有跨网关重建的持久挂载。如果要求现在增加持久挂载并重建网关，必须另行批准共享网关及旧续期记录的配套变更。新证书续期与 reload 仍需验证，签发成功不等于续期已接通。
+用户已确认首期独立配置、不重建共享网关。配置只能保留到网关容器被重建前；容器 restart 不会丢失，但 recreate 会丢失。服务器侧配置源与固定 `publish` 恢复操作已保留，不能宣称已有跨网关重建的持久挂载。如果要求增加持久挂载并重建网关，必须另行批准共享网关及旧续期记录的配套变更。
+
+专用续期消费者已在生产安装并核验：
+
+- 私有固定恢复程序：`/data/services/parallellines-entertainment/operations.py`，root 所有、0600；不含部署连接 Secrets。
+- 调度：`/etc/cron.d/parallellines-entertainment-renew`，root 所有、0644，`37 */6 * * *`，按服务器 cron 时区运行；不修改已有 cron。
+- 只处理证书名 `parallellines-entertainment`，原生 `certbot renew` 关闭旧 hooks 和随机 sleep，不强制轮换。证书变更或 loaded 身份落后时，才按既有归属守卫合法 reload；旧证书已经过期也可进入原生续期，不以旧公网 TLS 健康为前置。
+- 初次真实调用结果为 `not_due`，证书、网关均未无故改变；独立 `renewal-status` 确认调度活跃、安装来源和权限正确、最近调用成功且没有待加载证书。这不是实际证书轮换证明。
+- 网关被重建、自有配置层丢失，或旧 Tools reload 源码/配置归属发生变化时会明确停止并保留服务；由操作者先核对来源与前像，必要时 `publish` 恢复，不能放宽旧守卫。
+
+服务器管理员可脱离 GitHub 连接执行以下只读检查：
+
+```sh
+sudo /usr/bin/python3 -B /data/services/parallellines-entertainment/operations.py health
+sudo /usr/bin/python3 -B /data/services/parallellines-entertainment/operations.py renewal-status
+```
+
+同一固定程序也保留 `publish / retract / stop / renew`，均只处理本模块，并继续执行原有身份及归属检查；不要把它改成任意脚本入口。
 
 本阶段不另部署 TURN、MatrixRTC 或其他音视频服务，也不修改界面隐藏按钮。未配置或验收的音视频、联邦功能不作为上线承诺。
 
@@ -84,7 +101,7 @@
 
 - 启动失败仅停止本项目服务，保留 `runtime/`、`data/synapse/`、`data/postgres/` 和回执，不删库、不换密码、不重新生成 signing key。
 - 对外开放后撤回，仅处理本模块新增入口及本次附加网络，核网关健康后停止本项目；不恢复或重建整套主站。
-- 在固定生产根确认归属后，可用 `docker compose --project-name parallellines-entertainment --file compose.yaml stop` 停止本项目。严禁 `down -v`、全局 prune 或任何其他服务停止。
+- 正常停止使用固定 `stop` 操作，它会先合法撤回本模块入口。只有人工确认公网入口已撤回、运行目录归属无误后，才可直接用 `docker compose --project-name parallellines-entertainment --file compose.yaml stop` 停止本项目。归属守卫拒绝时不能强停仍可能被代理的后端；严禁 `down -v`、全局 prune 或任何其他服务停止。
 - 升级前保留旧镜像、Compose、Element 配置、完整 Synapse 私有配置与 signing key、媒体和 PostgreSQL 一致备份；数据库备份使用 PostgreSQL 支持的方式，不能把运行中的目录拷贝冒充一致备份。
 - 不自动回灌旧数据库抹掉后续消息或账号，不默认旧镜像兼容新 schema。恢复需明确目标版本与数据兼容性；后续镜像升级不沿用首次部署授权。
 
