@@ -2,7 +2,7 @@
 
 ## 1. 范围与状态
 
-用户已选定 Matrix + Element，并确认两个域名；首期使用原生邀请码注册。2026-11-18 已确认本地主站登录接入，配置和固定消费者尚未发布，生产更新与重启仍需另行授权，详见 [主站登录说明](MAIN_SITE_LOGIN.md)。不修改产品界面、主题、品牌、翻译、Labs 或设备验证，不接 Bot、Key、平台余额或 Chat 导航，不全局关闭加密。
+用户已选定 Matrix + Element，并确认两个域名；首期使用原生邀请码注册。2026-11-18 已确认本地主站登录接入，后续只使用主站登录。接入配置和固定发布、回退动作准备不代表线上生效，生产更新与重启仍需另行授权，详见 [主站登录说明](MAIN_SITE_LOGIN.md)。不修改 Tavern 界面、主题、品牌、翻译、Labs 或设备验证，不接 Bot、Key 或平台余额，不全局关闭加密。Chat 侧栏入口独立发布。
 
 按用户要求直接在生产运行，不在本机启动应用、构建、执行 Compose 校验或业务测试。站点已发布，实际检查结果见 `DEPLOYMENT-20261117.md`；本文件与镜像锁不能代替真实账号、房间消息或设备恢复验收。
 
@@ -45,13 +45,13 @@
 
 首期锁定来源的 `config/synapse-public.yaml` 设置域名、公网基址、容器内反代 listener、PostgreSQL 连接非秘密字段和邀请码注册；当前根配置在同一部署边界内改为原生 OIDC。Listener 保留原生 `client / federation` 资源语义，没有加入全局联邦黑白名单。是否开放额外联邦委派或端口由实际入口范围确定，不能把未验收的跨服务器聊天列为首版完成能力。
 
-## 4. 首期原生账号与主站登录兼容
+## 4. 首期原生账号与切换后的权限
 
 - 首期使用 `enable_registration: true` 和 `registration_requires_token: true`，保持 `enable_registration_without_verification` 默认 false；不开放无验证注册。主站登录切换后关闭独立注册，仅允许已认证主站用户经 OIDC 原生创建本站账号，不使用邀请码。
 - 初始管理员通过 Synapse 原生 `register_new_matrix_user` 或原生共享秘密注册接口创建，凭据只留服务器私有记录；不得在命令日志或交付材料中输出口令、共享秘密和管理员 token。
 - 注册邀请码由 Synapse 原生 Registration Tokens Admin API 管理；Element 使用原生注册验证步骤，不编写新注册页面。邀请码的实际用途次数和有效期须在发放时明确，不在公开仓库保存真实令牌。
 - 保留 Element 原生设备验证与加密恢复流程。新浏览器可能要求已有设备或恢复密钥验证，不用关闭 `force_verification` 来跳过验收。
-- 主站登录以稳定 `sub` 绑定本站身份，不自动认领同名或同邮箱旧账号。生产切换前须核实旧账号和管理员的后续访问方案；本次不创建或写入外部身份映射，不迁移或删除历史。
+- 主站登录以稳定 `sub` 绑定本站身份。旧 Matrix 账号（含管理员）不需要保留原身份的登录入口；不做旧身份映射、数据迁移、自动升权或主动注销。若后续确需 Synapse 管理权限，另经授权向指定主站账号对应的 Matrix ID 授权，不复用主站管理员角色。
 
 ## 5. 生产发布与公网入口
 
@@ -91,7 +91,7 @@ sudo /usr/bin/python3 -B /data/services/parallellines-entertainment/operations.p
 1. PostgreSQL 原生 `pg_isready` 就绪后启动 Synapse；核对新数据库的 UTF8、C locale 和原生 schema 初始化，不连接其他数据库。
 2. Element 保留官方镜像 healthcheck `/config.json`；Synapse 保留官方镜像 healthcheck `/health`。这两者不能代替数据库、跨域或聊天验收。
 3. 独立读取 `/_matrix/client/versions` 与原生登录/注册能力，核 HTTPS、Element 配置中的 homeserver、CORS 和两个域的路由；真实页面可加载不等于已经能聊天。
-4. 切换前用本实例两个验收账号走原生邀请码注册/登录；切换后按 [主站登录说明](MAIN_SITE_LOGIN.md) 分别验证主站已登录和未登录入口。继续验收设备验证、创建房间、邀请/加入、双方发收消息、刷新后历史、退出与恢复，记录实际页面截图和结果。不得在既有系统造无关业务数据。
+4. 首期原生邀请码注册和登录的验收状态见部署记录，不作为主站登录切换前置。切换后按 [主站登录说明](MAIN_SITE_LOGIN.md) 分别验证主站已登录和未登录入口。获准后用两个主站验收账号检查设备验证、创建房间、邀请/加入、双方发收消息、刷新后历史、退出与恢复，记录实际页面截图和结果。不得在既有系统造无关业务数据。
 5. 核现有 Chat、主站、身份桥和模型网关的服务身份及健康没有被本次改变，再记录本次真实发布范围与未验收项。
 
 不输出完整 Compose 环境、容器环境、私有配置、数据库口令、signing key、注册共享秘密、邀请码、用户或管理员 token。不启用 `SYNAPSE_LOG_SENSITIVE` / `SYNAPSE_LOG_TESTING`，不把 SQL 日志升至 DEBUG；必要错误只收集有界、审查过的状态和稳定错误码。
@@ -108,9 +108,9 @@ sudo /usr/bin/python3 -B /data/services/parallellines-entertainment/operations.p
 
 ## 8. 主站登录配置更新
 
-本地接入仅准备配置、身份桥新客户端和固定运维消费者，不改变生产状态。获准上线后先完成身份桥新客户端的独立密钥与单实例发布，再执行固定主站登录更新；不能先关闭 Tavern 原生登录而让新客户端仍未注册。
+本地接入仅准备配置、身份桥新客户端和固定运维消费者，不改变生产状态。获准上线后先准备独立密钥并执行 `publish-tavern-bridge`，确认新客户端正常注册后再执行 `enable-main-login`。线上主站登录人工验收通过后，才执行 `publish-tavern-frontend`。
 
-Element 自动跳转、Synapse 原生 OIDC、旧账号访问前置、低负载验收和精确配置恢复统一维护在 [主站登录说明](MAIN_SITE_LOGIN.md)。不要用首次 `prepare/deploy`、重建网关或改写已安装证书续期程序代替登录更新。
+Element 自动跳转、Synapse 原生 OIDC、旧账号处理、真实验收及三个组件的回退顺序统一维护在 [主站登录说明](MAIN_SITE_LOGIN.md)。`restore-main-login` 是精确配置恢复，不提供并行第二套登录。不要用首次 `prepare/deploy`、重建网关或改写已安装证书续期程序代替登录更新。
 
 ## 官方依据
 

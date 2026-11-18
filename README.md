@@ -7,7 +7,7 @@
 - 网页入口：`https://tavern.pingxingxian.space`。
 - Homeserver：`https://matrix.pingxingxian.space`；身份形如 `@用户名:matrix.pingxingxian.space`，此身份域初始化后不能直接改名。
 - 首期使用原生独立账号和邀请码注册；现已确认接入主站登录，接入材料仍待发布。保留 Element 原生布局、品牌、语言选择、主题、Labs 与设备验证。
-- 不接入 Bot、模型 Key、平台余额或现有 Chat 导航，不全局关闭加密。
+- 不接入 Bot、模型 Key 或平台余额，不全局关闭加密。Chat 侧栏入口由 Chat 独立发布，Tavern 不接管现有 Chat 导航。
 - 不替换现有 Chat、主站、身份桥或模型网关，不复用它们的数据和密钥。
 - 按用户要求直接生产运行和验收，不在本机启动应用、构建或业务测试。
 
@@ -17,7 +17,7 @@
 
 实际版本、操作结果和限制见 [首次部署记录](docs/DEPLOYMENT-20261117.md)。镜像锁保留配方准备时的公开来源证据，不冒充运行回执。
 
-**主站登录切换。** 2026-11-18 用户确认使用主站登录，不再额外注册或输入本站密码。配置采用 Synapse 原生 OIDC 和 Element 自动 SSO 跳转，复用已有身份桥的独立 `parallellines-tavern` 客户端。聊天频道尚未登录时，主站已有会话则自动接续，否则只在主站登录；设备验证和加密恢复仍保留。已有 Matrix 会话不自动切换账号或随主站退出而失效。仓库配置不代表线上已切换，接入、旧账号处理和恢复见 [主站登录说明](docs/MAIN_SITE_LOGIN.md)。
+**主站登录切换。** 2026-11-18 用户确认只用主站登录，不再独立注册或输入 Matrix 密码。配置采用 Synapse 原生 OIDC 和 Element 自动 SSO 跳转，复用已有身份桥的独立 `parallellines-tavern` 客户端。聊天频道尚未登录时，主站已有会话则自动接续，否则只在主站登录；设备验证和加密恢复仍保留。旧 Matrix 账号（含管理员）无需以原身份重新登录，数据和已有会话保留；新身份不自动继承旧权限。仓库配置不代表线上已切换，接入、验收和回退见 [主站登录说明](docs/MAIN_SITE_LOGIN.md)。
 
 用户已授权维护公开仓库 `ixiaoyy/parallellines-entertainment`，并在主站 Actions 仅增加固定娱乐模块运维入口，复用现有连接，不读取或复制 Secrets。不能拿旧 Chat 的发布参数创建本模块。
 
@@ -30,7 +30,7 @@
 | `config/element.json` | 固定本实例 homeserver，并启用原生 SSO 自动跳转，不改主题或设备验证 |
 | `config/synapse-public.yaml` | 必要原生非秘密配置及主站 OIDC；不含运行密钥，不可单独启动 |
 | `docs/OPERATIONS.md` | 原生生成、私有配置、生产验收与停止恢复契约 |
-| `docs/MAIN_SITE_LOGIN.md` | 主站登录合同、生产切换前置、原生账号兼容与配置恢复 |
+| `docs/MAIN_SITE_LOGIN.md` | 单一登录、账号与权限边界、固定发布和回退 |
 | `NOTICE.md` | 上游来源和许可证说明 |
 
 生产根固定为 `/data/services/parallellines-entertainment`。所有运行凭据、signing key、媒体和数据库均留在其私有 `runtime/` / `data/` 内，不能随源码发布。
@@ -39,7 +39,7 @@
 
 主站登录切换前，已部署首期仍使用原生账号和邀请码；服务器应为 `matrix.pingxingxian.space`。切换后只使用主站登录，新主站用户由 Synapse 原生 SSO 自动创建本站身份，不再需要邀请码。
 
-注册需要邀请码。服务器管理员可在私有文件 `/data/services/parallellines-entertainment/data/synapse/bootstrap-private.json` 中取用 `invite_token`，只私下发给注册者，不要分享整个文件或在公开 Actions 日志中输出。首批邀请码最多 10 次，初始有效期 7 天，具体到期值以该文件和原生 API 为准。
+仅首期原生注册使用邀请码；主站登录切换后不再发放或使用。首批邀请码最多 10 次，初始有效期 7 天，具体到期值以私有引导回执 `/data/services/parallellines-entertainment/data/synapse/bootstrap-private.json` 和原生 API 为准。不要分享私有回执或在公开 Actions 日志中输出邀请码。
 
 首次登录按 Element 原生提示完成设备验证并妥善保管恢复密钥；本项目没有关闭或改写这一流程。
 
@@ -49,4 +49,4 @@
 
 ## 后续边界
 
-现有 Chat 继续提供原有能力。此次只统一新登录，不自动合并既有 Matrix 账号、不迁移消息、不实现跨站统一注销。后续若要增加账号绑定、统一注销或 Bot，应另核原生接口和授权，不重写房间与消息系统。
+现有 Chat 继续提供原有能力。此次只统一新登录，不自动合并既有 Matrix 账号、不迁移消息、不自动授予 Synapse 管理员、不实现跨站统一注销。已有 Matrix 会话不会随主站退出而失效，切换主站账号也不会自动切换已有 Matrix 会话。
