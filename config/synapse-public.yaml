@@ -1,5 +1,5 @@
 # 仅包含本次确认的原生非秘密设置；不得把本文件直接作为完整运行配置。
-# 发布操作先运行官方 generate，再合并这些字段并补入服务器私有数据库口令。
+# 全新实例先运行官方 generate；既有实例使用固定主站登录更新操作，不重新生成私有配置。
 server_name: matrix.pingxingxian.space
 public_baseurl: https://matrix.pingxingxian.space/
 
@@ -24,6 +24,32 @@ database:
     cp_min: 5
     cp_max: 10
 
-# 使用 Synapse 原生邀请码验证；不启用无验证的公开注册。
-enable_registration: true
-registration_requires_token: true
+# 普通用户只使用主站登录；首次 SSO 登录由下方提供方创建本实例账号，无需邀请码。
+enable_registration: false
+password_config:
+  # 只保留旧账号敏感操作的原生再验证，不再接受独立密码登录。
+  enabled: only_for_reauth
+
+oidc_providers:
+  - idp_id: parallellines
+    idp_name: 平行线
+    issuer: https://pingxingxian.space/auth/oidc
+    client_id: parallellines-tavern
+    # 与身份桥 TAVERN_OIDC_CLIENT_SECRET 对应的独立私有文件，不使用其他客户端密钥。
+    client_secret_path: /data/tavern-oidc-client-secret
+    client_auth_method: client_secret_basic
+    pkce_method: always
+    scopes: [openid, profile]
+    # 登录时复核主站当前会话；不以邮箱或可改的用户名合并既有 Matrix 账号。
+    user_profile_method: userinfo_endpoint
+    allow_existing_users: false
+    enable_registration: true
+    user_mapping_provider:
+      config:
+        localpart_template: "pl_{{ user.sub }}"
+        display_name_template: "{{ user.name }}"
+
+sso:
+  # 必须保留域名后的斜线，避免前缀白名单匹配到其他站点。
+  client_whitelist:
+    - https://tavern.pingxingxian.space/
