@@ -1,0 +1,920 @@
+diff --git a/src/agent/manager.rs b/src/agent/manager.rs
+index da30fdb..1e1347f 100644
+--- a/src/agent/manager.rs
++++ b/src/agent/manager.rs
+@@ -31,6 +31,14 @@ impl Manager {
+         Ok(Self { static_agents })
+     }
+ 
++    /// 试用实例只使用唯一的静态角色，避免房间或远程配置切换模型。
++    pub(crate) fn only_static_agent(&self) -> Option<&AgentInstance> {
++        match self.static_agents.as_slice() {
++            [agent] => Some(agent),
++            _ => None,
++        }
++    }
++
+     pub fn available_room_agents_by_room_config_context(
+         &self,
+         room_config_context: &RoomConfigContext,
+diff --git a/src/agent/provider/entity/text_generation/mod.rs b/src/agent/provider/entity/text_generation/mod.rs
+index c148bd5..a916861 100644
+--- a/src/agent/provider/entity/text_generation/mod.rs
++++ b/src/agent/provider/entity/text_generation/mod.rs
+@@ -8,6 +8,7 @@ pub struct TextGenerationParams {
+     pub prompt_override: Option<String>,
+     pub temperature_override: Option<f32>,
+     pub prompt_variables: TextGenerationPromptVariables,
++    pub(crate) tavern_flux: Option<super::super::openai_compat::TavernFluxContext>,
+ }
+ 
+ pub struct TextGenerationResult {
+diff --git a/src/agent/provider/openai_compat/controller.rs b/src/agent/provider/openai_compat/controller.rs
+index daed2d8..ef1d71c 100644
+--- a/src/agent/provider/openai_compat/controller.rs
++++ b/src/agent/provider/openai_compat/controller.rs
+@@ -38,15 +38,17 @@ pub struct Controller {
+ }
+ 
+ impl Controller {
+-    pub fn new(config: Config) -> Self {
+-        // Local models (e.g. LocalAI, Ollama) and image generation can be slow, so use a generous
+-        // timeout instead of reqwest's default (none). `build` only fails on TLS/system init.
++    pub fn new(config: Config) -> anyhow::Result<Self> {
++        // 试用只允许指定网关；不给重定向目标转发请求或隐式降级超时限制。
+         let http = reqwest::Client::builder()
+-            .timeout(std::time::Duration::from_secs(600))
+-            .build()
+-            .unwrap_or_else(|_| reqwest::Client::new());
+-
+-        Self { config, http }
++            .https_only(true)
++            .redirect(reqwest::redirect::Policy::none())
++            .retry(reqwest::retry::never())
++            .connect_timeout(std::time::Duration::from_secs(5))
++            .timeout(std::time::Duration::from_secs(75))
++            .build()?;
++
++        Ok(Self { config, http })
+     }
+ 
+     fn url(&self, path: &str) -> String {
+@@ -62,6 +64,23 @@ impl Controller {
+             _ => request,
+         }
+     }
++
++    /// 付费路由必须同时有原生房间和事件；其他使用方不接受付费事件来源。
++    fn chat_request(
++        &self,
++        tavern_flux: Option<super::TavernFluxContext>,
++    ) -> anyhow::Result<reqwest::RequestBuilder> {
++        match (self.config.base_url.as_str(), tavern_flux) {
++            (super::TAVERN_FLUX_BASE_URL, Some(context)) => Ok(self
++                .post("chat/completions")
++                .header("X-Tavern-Room-Id", context.room_id.as_str())
++                .header("X-Tavern-Event-Id", context.event_id.as_str())),
++            (super::TAVERN_FLUX_BASE_URL, None) | (_, Some(_)) => {
++                anyhow::bail!("Tavern Flux request is missing its authorized route or event")
++            }
++            (_, None) => Ok(self.post("chat/completions")),
++        }
++    }
+ }
+ 
+ impl ControllerTrait for Controller {
+@@ -139,8 +158,6 @@ impl ControllerTrait for Controller {
+         let openai_conversation_messages =
+             super::utils::convert_llm_messages_to_openai_messages(conversation_messages);
+ 
+-        let messages_count = openai_conversation_messages.len();
+-
+         let temperature = params
+             .temperature_override
+             .unwrap_or(text_generation_config.temperature);
+@@ -152,26 +169,21 @@ impl ControllerTrait for Controller {
+             max_tokens: text_generation_config.max_response_tokens,
+         };
+ 
+-        if let Ok(request_as_json) = serde_json::to_string(&request) {
+-            tracing::trace!(
+-                model = format!("{:?}", request.model),
+-                ?messages_count,
+-                request = request_as_json,
+-                "Sending OpenAI-compat chat completion API request"
+-            );
+-        }
+-
+-        let response = self.post("chat/completions").json(&request).send().await?;
+-        if !response.status().is_success() {
+-            return Err(error_from_response("chat completion", response).await);
++        let outgoing = self.chat_request(params.tavern_flux)?;
++        // 网关可能回显房间内容。只记录状态，不记录请求、回复或错误正文。
++        let response = outgoing.json(&request).send().await?;
++        let status = response.status();
++        if !status.is_success() {
++            return Err(response
++                .error_for_status()
++                .err()
++                .map(anyhow::Error::from)
++                .unwrap_or_else(|| {
++                    anyhow::anyhow!("Chat gateway returned a non-success HTTP status")
++                }));
+         }
+         let response: ChatCompletionResponse = response.json().await?;
+ 
+-        tracing::trace!(
+-            ?response,
+-            "Got response from the OpenAI-compat chat completion API"
+-        );
+-
+         // We only request 1 result, so there should only be 1 choice.
+         if let Some(choice) = response.choices.into_iter().next() {
+             let Some(message) = choice.message else {
+@@ -422,3 +434,58 @@ impl ControllerTrait for Controller {
+         Some(text_to_speech_config.speed)
+     }
+ }
++
++#[cfg(test)]
++mod tavern_gateway_tests {
++    use super::*;
++
++    fn paid_event() -> crate::agent::provider::openai_compat::TavernFluxContext {
++        use mxlink::matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
++        crate::agent::provider::openai_compat::TavernFluxContext {
++            room_id: OwnedRoomId::try_from("!tavern:example.org").unwrap(),
++            event_id: OwnedEventId::try_from("$test_event").unwrap(),
++        }
++    }
++
++    #[test]
++    fn paid_request_uses_only_service_bearer_and_actual_event_headers() {
++        let paid = Controller::new(Config {
++            base_url: crate::agent::provider::openai_compat::TAVERN_FLUX_BASE_URL.to_owned(),
++            api_key: Some("synthetic-service-token".to_owned()),
++            ..Config::default()
++        })
++        .unwrap();
++        assert!(paid.chat_request(None).is_err());
++        let request = paid
++            .chat_request(Some(paid_event()))
++            .unwrap()
++            .build()
++            .unwrap();
++        assert_eq!(request.method(), reqwest::Method::POST);
++        assert_eq!(
++            request.url().as_str(),
++            "https://api.pingxingxian.space/tavern-flux/v1/chat/completions"
++        );
++        assert_eq!(
++            request.headers()["Authorization"],
++            "Bearer synthetic-service-token"
++        );
++        assert_eq!(request.headers()["X-Tavern-Room-Id"], "!tavern:example.org");
++        assert_eq!(request.headers()["X-Tavern-Event-Id"], "$test_event");
++        assert_eq!(request.headers().len(), 3);
++
++        let ordinary = Controller::new(Config {
++            base_url: "https://example.org/v1".to_owned(),
++            ..Config::default()
++        })
++        .unwrap();
++        assert!(ordinary.chat_request(Some(paid_event())).is_err());
++        let request = ordinary.chat_request(None).unwrap().build().unwrap();
++        assert_eq!(
++            request.url().as_str(),
++            "https://example.org/v1/chat/completions"
++        );
++        assert!(!request.headers().contains_key("X-Tavern-Room-Id"));
++        assert!(!request.headers().contains_key("X-Tavern-Event-Id"));
++    }
++}
+diff --git a/src/agent/provider/openai_compat/mod.rs b/src/agent/provider/openai_compat/mod.rs
+index d569f97..36371be 100644
+--- a/src/agent/provider/openai_compat/mod.rs
++++ b/src/agent/provider/openai_compat/mod.rs
+@@ -15,6 +15,14 @@ mod wire;
+ pub use config::Config;
+ pub use controller::Controller;
+ 
++pub(crate) const TAVERN_FLUX_BASE_URL: &str = "https://api.pingxingxian.space/tavern-flux/v1";
++
++/// 付费调用来源仅由已解密的 Matrix 事件提供，网关按原生房间和消息授权计费。
++pub(crate) struct TavernFluxContext {
++    pub(crate) room_id: mxlink::matrix_sdk::ruma::OwnedRoomId,
++    pub(crate) event_id: mxlink::matrix_sdk::ruma::OwnedEventId,
++}
++
+ use super::super::AgentInstantiationError;
+ use super::super::AgentInstantiationResult;
+ use super::ConfigTrait;
+@@ -42,9 +50,9 @@ pub fn create_controller_from_yaml_value_config(
+         }
+     };
+ 
+-    Ok(ControllerType::OpenAICompat(Box::new(Controller::new(
+-        config,
+-    ))))
++    let controller =
++        Controller::new(config).map_err(AgentInstantiationError::ConstructionFailed)?;
++    Ok(ControllerType::OpenAICompat(Box::new(controller)))
+ }
+ 
+ pub fn default_config() -> Config {
+diff --git a/src/bot/implementation.rs b/src/bot/implementation.rs
+index ffa793d..b2600ab 100644
+--- a/src/bot/implementation.rs
++++ b/src/bot/implementation.rs
+@@ -56,6 +56,7 @@ struct BotInner {
+     room_display_name_fetcher: Arc<RoomDisplayNameFetcher>,
+     agent_manager: Manager,
+     admin_pattern_regexes: Vec<regex::Regex>,
++    tavern_pilot: super::tavern::TavernPilot,
+ }
+ 
+ /// Bot represents a bot instance.
+@@ -77,11 +78,32 @@ impl Bot {
+         let admin_pattern_regexes = config.access.admin_pattern_regexes()?;
+         let persistence_config_encryption_key = config.persistence.config_encryption_key()?;
+ 
++        let tavern_pilot = super::tavern::TavernPilot::new(&config)?;
+         let agent_manager = AgentManager::new(config.agents.static_definitions.clone())?;
+ 
+         let encryption_manager = EncryptionManager::new(persistence_config_encryption_key);
+ 
+-        let matrix_link = create_matrix_link(&config).await?;
++        // 启动时校对真实账号和设备，错用令牌或状态目录不能更新其他账号的资料。
++        use std::time::Duration;
++        let ConfigUserAuth::AccessToken { user_id, device_id, .. } =
++            config.user.auth_config(&config.homeserver.server_name)?
++        else {
++            anyhow::bail!("Tavern pilot requires a Matrix device token");
++        };
++        let matrix_link = tokio::time::timeout(Duration::from_secs(45), create_matrix_link(&config))
++            .await
++            .map_err(|_| anyhow::anyhow!("Tavern pilot Matrix initialization timed out"))??;
++        let client = matrix_link.client();
++        let identity = tokio::time::timeout(Duration::from_secs(15), client.whoami())
++            .await
++            .map_err(|_| anyhow::anyhow!("Tavern pilot Matrix identity check timed out"))?
++            .map_err(|_| anyhow::anyhow!("Tavern pilot Matrix identity check failed"))?;
++        anyhow::ensure!(
++            matrix_link.user_id() == &user_id
++                && identity.user_id == user_id
++                && identity.device_id.as_ref() == Some(&device_id),
++            "Tavern pilot Matrix account or device does not match configuration"
++        );
+ 
+         let catch_up_marker_manager = create_catch_up_marker_manager(matrix_link.clone());
+ 
+@@ -121,6 +143,7 @@ impl Bot {
+                 room_display_name_fetcher: Arc::new(room_display_name_fetcher),
+                 agent_manager,
+                 admin_pattern_regexes,
++                tavern_pilot,
+             }),
+         })
+     }
+@@ -238,14 +261,17 @@ impl Bot {
+             .await
+     }
+ 
+-    pub async fn start(&self) -> anyhow::Result<()> {
+-        self.rooms().attach_event_handlers().await;
+-        self.messaging().attach_event_handlers().await;
+-        self.reacting().attach_event_handlers().await;
+-
+-        self.inner.delayed_catch_up_marker_manager.start().await;
++    /// 返回试用实例的静态房间及触发状态。
++    pub(super) fn tavern_pilot(&self) -> &super::tavern::TavernPilot {
++        &self.inner.tavern_pilot
++    }
+ 
+-        self.prepare_profile().await?;
++    pub async fn start(&self) -> anyhow::Result<()> {
++        // 正常启动一次同步角色资料，不对失败的头像上传进行无界重试。
++        tokio::time::timeout(std::time::Duration::from_secs(30), self.do_prepare_profile())
++            .await
++            .map_err(|_| anyhow::anyhow!("Tavern pilot Matrix profile update timed out"))??;
++        super::tavern::TavernPilot::attach(self);
+ 
+         self.inner
+             .matrix_link
+diff --git a/src/bot/mod.rs b/src/bot/mod.rs
+index 5114123..108f2c0 100644
+--- a/src/bot/mod.rs
++++ b/src/bot/mod.rs
+@@ -3,6 +3,9 @@ mod load_config;
+ mod messaging;
+ mod reacting;
+ mod rooms;
++mod tavern;
++mod tavern_admission;
++mod tavern_room;
+ 
+ pub use implementation::Bot;
+ pub use load_config::load as load_config;
+diff --git a/src/bot/tavern.rs b/src/bot/tavern.rs
+new file mode 100644
+--- /dev/null
++++ b/src/bot/tavern.rs
+@@ -0,0 +1,308 @@
++use std::time::Duration;
++
++use chrono::Utc;
++use mxlink::matrix_sdk::{
++    EncryptionState, Room, RoomState,
++    deserialized_responses::EncryptionInfo,
++    ruma::events::room::message::{
++        MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
++        sanitize::remove_plain_reply_fallback,
++    },
++};
++use mxlink::{CallbackError, MessageResponseType, ThreadInfo};
++
++use crate::agent::{
++    AgentProvider, ControllerTrait,
++    provider::{TextGenerationParams, TextGenerationPromptVariables, openai_compat},
++};
++use crate::conversation::llm::{Author, Conversation, Message, MessageContent};
++use crate::entity::cfg::Config;
++
++use super::{
++    Bot,
++    tavern_admission::{Admission, Decision, gateway_notice, is_new},
++    tavern_room::{eligible_invitation, joined_after},
++};
++
++const MAX_MESSAGE_BYTES: usize = 4096;
++const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
++const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
++
++pub(super) struct TavernPilot {
++    invites: tokio::sync::Notify,
++    admission: std::sync::Mutex<Admission>,
++    generation: tokio::sync::Mutex<()>,
++}
++
++impl TavernPilot {
++    /// 从静态配置收紧试用范围，配置不完整时在 Matrix 登录前停止。
++    pub(super) fn new(config: &Config) -> anyhow::Result<Self> {
++        // 房间和用户由 Matrix 原生成员关系授权；房间内没有 Bot 管理命令。
++        anyhow::ensure!(
++            config.access.admin_patterns.is_empty(),
++            "Tavern pilot does not allow admin patterns"
++        );
++        anyhow::ensure!(
++            config.logging == "warn" && config.user.mxid_localpart.starts_with("bot_"),
++            "Tavern pilot requires warning-only logging and a dedicated bot_ Matrix account"
++        );
++        anyhow::ensure!(
++            config.user.password.as_deref().is_none_or(str::is_empty),
++            "Tavern pilot requires Matrix access token and device ID, not password login"
++        );
++
++        let [agent] = config.agents.static_definitions.as_slice() else {
++            anyhow::bail!("Tavern pilot requires exactly one static agent");
++        };
++        anyhow::ensure!(
++            agent.id == "role" && matches!(&agent.provider, AgentProvider::OpenAICompat),
++            "Tavern pilot requires the static/role openai-compatible agent"
++        );
++        let provider: openai_compat::Config = serde_yaml_ng::from_value(agent.config.clone())
++            .map_err(|_| anyhow::anyhow!("Invalid Tavern pilot agent configuration"))?;
++        anyhow::ensure!(
++            provider.base_url == openai_compat::TAVERN_FLUX_BASE_URL,
++            "Tavern Flux role requires the dedicated paid gateway URL"
++        );
++        anyhow::ensure!(
++            provider
++                .api_key
++                .as_deref()
++                .is_some_and(|key| !key.trim().is_empty()),
++            "Tavern Flux role requires its dedicated gateway service token"
++        );
++        let text = provider
++            .text_generation
++            .ok_or_else(|| anyhow::anyhow!("Tavern pilot requires text generation settings"))?;
++        anyhow::ensure!(
++            !text.model_id.trim().is_empty()
++                && text.model_id != "some-model"
++                && text
++                    .prompt
++                    .as_deref()
++                    .is_some_and(|prompt| !prompt.trim().is_empty())
++                && matches!(text.max_response_tokens, Some(1..=1024)),
++            "Tavern pilot needs a fixed model, character prompt and 1..=1024 response tokens"
++        );
++
++        Ok(Self {
++            invites: tokio::sync::Notify::new(),
++            admission: std::sync::Mutex::default(),
++            generation: tokio::sync::Mutex::default(),
++        })
++    }
++
++    /// 复用 Matrix 原生邀请及加密消息接线，不挂载命令/反应入口。
++    pub(super) fn attach(bot: &Bot) {
++        use mxlink::matrix_sdk::ruma::events::room::member::{
++            MembershipState, StrippedRoomMemberEvent,
++        };
++
++        let pilot_bot = bot.clone();
++        bot.matrix_link().client().add_event_handler(
++            move |event: StrippedRoomMemberEvent, room: Room| async move {
++                if &event.state_key == pilot_bot.user_id()
++                    && event.content.membership == MembershipState::Invite
++                    && room.state() == RoomState::Invited
++                {
++                    pilot_bot.tavern_pilot().invites.notify_one();
++                }
++            },
++        );
++
++        // 统一从 SDK 的现存邀请房读取，合并批量邀请，不重建房间列表。
++        let pilot_bot = bot.clone();
++        tokio::spawn(async move {
++            pilot_bot.tavern_pilot().process_invites(&pilot_bot).await;
++        });
++        bot.tavern_pilot().invites.notify_one();
++
++        let started_at_ms = Utc::now().timestamp_millis();
++        let pilot_bot = bot.clone();
++        // 要求 SDK 确认本事件解密成功；不能只看房间标记，也不能接受明文伪造事件。
++        bot.matrix_link().client().add_event_handler(
++            move |event: OriginalSyncRoomMessageEvent,
++                  room: Room,
++                  crypto: Option<EncryptionInfo>| async move {
++                if crypto.is_none() {
++                    return;
++                }
++                tokio::spawn(async move {
++                    if let Err(err) = pilot_bot
++                        .tavern_pilot()
++                        .on_message(&pilot_bot, room, event, started_at_ms)
++                        .await
++                    {
++                        tracing::warn!(?err, "Tavern actionable message failed");
++                    }
++                });
++            },
++        );
++    }
++
++    /// 同一实例串行核对和接受原生邀请；只加入具有正面私密、加密证据的房间。
++    /// 失败让原生成员状态负责恢复，不创建额外绑定或后台重复重试任务。
++    async fn process_invites(&self, bot: &Bot) {
++        let client = bot.matrix_link().client();
++        loop {
++            self.invites.notified().await;
++            for room in client.invited_rooms() {
++                match eligible_invitation(&room).await {
++                    Ok(true) => {}
++                    Ok(false) => continue,
++                    Err(_) => {
++                        tracing::warn!("Could not verify Tavern invite state; not joining");
++                        continue;
++                    }
++                }
++                match tokio::time::timeout(JOIN_TIMEOUT, room.join()).await {
++                    Ok(Ok(())) => {}
++                    Ok(Err(_)) => tracing::warn!("Tavern room join failed; native invite retained"),
++                    Err(_) => tracing::warn!("Tavern room join result unknown"),
++                }
++            }
++        }
++    }
++
++    /// 只有新发的纯文本和真实提及可送模型；用原生规则去引用前缀，不回读历史。
++    async fn on_message(
++        &self,
++        bot: &Bot,
++        room: Room,
++        event: OriginalSyncRoomMessageEvent,
++        started_at_ms: i64,
++    ) -> Result<(), CallbackError> {
++        if &event.sender == bot.user_id()
++            || room.state() != RoomState::Joined
++            || !matches!(room.encryption_state(), EncryptionState::Encrypted)
++            || !event
++                .content
++                .mentions
++                .as_ref()
++                .is_some_and(|mentions| mentions.user_ids.iter().any(|user| user == bot.user_id()))
++        {
++            return Ok(());
++        }
++
++        let MessageType::Text(text) = &event.content.msgtype else {
++            return Ok(());
++        };
++        // 回复和线程只使用本事件的新增正文，SDK 的旧客户端引用前缀不传给模型。
++        let (body, response_type) = match &event.content.relates_to {
++            None => (
++                text.body.as_str(),
++                MessageResponseType::Reply(event.event_id.clone()),
++            ),
++            Some(Relation::Reply(_)) => (
++                remove_plain_reply_fallback(&text.body),
++                MessageResponseType::Reply(event.event_id.clone()),
++            ),
++            Some(Relation::Thread(thread)) => (
++                remove_plain_reply_fallback(&text.body),
++                MessageResponseType::InThread(ThreadInfo::new(
++                    thread.event_id.clone(),
++                    event.event_id.clone(),
++                )),
++            ),
++            // 拒绝替换（编辑）及其他关联类型，避免再次触发或夹带正文。
++            _ => return Ok(()),
++        };
++        let body = body.trim();
++        if body.is_empty() || body.len() > MAX_MESSAGE_BYTES {
++            return Ok(());
++        }
++
++        let timestamp_ms: u64 = event.origin_server_ts.0.into();
++        let Ok(timestamp_ms) = i64::try_from(timestamp_ms) else {
++            return Ok(());
++        };
++        let now = Utc::now();
++        let now_ms = now.timestamp_millis();
++        // 只使用当前已加入房间的正式状态；无资格或消息早于加入、启动都不响应。
++        let joined = joined_after(&room, bot.user_id()).await.map_err(|_| {
++            CallbackError::Unknown("Could not read verified Tavern room state".into())
++        })?;
++        if joined.is_none_or(|joined_ms| !is_new(timestamp_ms, started_at_ms, joined_ms, now_ms)) {
++            return Ok(());
++        }
++
++        // 所有房间共享一个模型请求；每房 10 秒至少间隔，不排队，不重复发送提示。
++        let generation = self.generation.try_lock();
++        let decision = self
++            .admission
++            .lock()
++            .map_err(|_| CallbackError::Unknown("Tavern event admission is unavailable".into()))?
++            .decide(
++                room.room_id().as_str(),
++                event.event_id.as_str(),
++                timestamp_ms,
++                now_ms,
++                generation.is_ok(),
++            );
++        let (generation, notice) = match decision {
++            Decision::Model => (generation.ok(), None),
++            Decision::RoomLimited => (None, Some("本房间调用太快，稍后再试。")),
++            Decision::Busy => (None, Some("角色正在回复，稍后再试。")),
++            Decision::Ignore => return Ok(()),
++        };
++        let reply = if let Some(notice) = notice {
++            notice.to_owned()
++        } else {
++            let agent = bot.agent_manager().only_static_agent().ok_or_else(|| {
++                CallbackError::Unknown("Tavern pilot static agent is missing".into())
++            })?;
++            let controller = agent.controller();
++            let conversation = Conversation {
++                messages: vec![Message {
++                    author: Author::User,
++                    sender_id: None,
++                    timestamp: now,
++                    content: MessageContent::Text(body.to_owned()),
++                }],
++            };
++            let params = TextGenerationParams {
++                prompt_variables: TextGenerationPromptVariables::new(
++                    bot.name(),
++                    &controller.text_generation_model_id().unwrap_or_default(),
++                    now,
++                    Some(now),
++                ),
++                tavern_flux: Some(openai_compat::TavernFluxContext {
++                    room_id: room.room_id().to_owned(),
++                    event_id: event.event_id.clone(),
++                }),
++                ..TextGenerationParams::default()
++            };
++
++            let started = std::time::Instant::now();
++            match controller.generate_text(conversation, params).await {
++                Ok(result) if !result.text.trim().is_empty() && result.text.len() <= 16_384 => {
++                    result.text
++                }
++                Ok(_) => {
++                    tracing::warn!(elapsed = ?started.elapsed(), "Tavern model returned empty or oversized text");
++                    "角色暂时无法回复。".to_owned()
++                }
++                Err(err) => {
++                    let request_error = err.downcast_ref::<reqwest::Error>();
++                    let status = request_error.and_then(reqwest::Error::status);
++                    let timeout = request_error.is_some_and(reqwest::Error::is_timeout);
++                    tracing::warn!(elapsed = ?started.elapsed(), ?status, timeout, "Tavern model generation failed");
++                    gateway_notice(status.map(|code| code.as_u16())).to_owned()
++                }
++            }
++        };
++
++        // 用纯文本机器人通知回复，避免把模型输出当作 HTML、外部媒体或新的提及。
++        let mut content = RoomMessageEventContent::notice_plain(reply);
++        let messaging = bot.matrix_link().messaging();
++        let send = messaging.send_event(&room, &mut content, response_type);
++        match tokio::time::timeout(REPLY_TIMEOUT, send).await {
++            Ok(Ok(_)) => {}
++            Ok(Err(_)) => tracing::warn!("Tavern pilot failed to send the Matrix reply"),
++            Err(_) => tracing::warn!("Tavern pilot Matrix reply timed out"),
++        }
++        drop(generation);
++        Ok(())
++    }
++}
+diff --git a/src/bot/tavern_admission.rs b/src/bot/tavern_admission.rs
+new file mode 100644
+index 0000000..568cab4
+--- /dev/null
++++ b/src/bot/tavern_admission.rs
+@@ -0,0 +1,122 @@
++use std::collections::HashMap;
++
++const MAX_EVENT_AGE_MS: i64 = 120_000;
++const MAX_SEEN_EVENTS: usize = 1024;
++const ROOM_MODEL_COOLDOWN_MS: i64 = 10_000;
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) enum Decision {
++    Model,
++    RoomLimited,
++    Busy,
++    Ignore,
++}
++
++#[derive(Default)]
++pub(super) struct Admission {
++    seen: HashMap<String, i64>,
++    room_last_call: HashMap<String, i64>,
++}
++
++impl Admission {
++    /// 先记新事件再给答复或模型一次机会；房间频率独立，全局并发由调用者持有。
++    /// 只保留时间窗口内的 ID，不存正文、不限制可加入的房间数。
++    pub(super) fn decide(
++        &mut self,
++        room_id: &str,
++        event_id: &str,
++        timestamp_ms: i64,
++        now_ms: i64,
++        generation_available: bool,
++    ) -> Decision {
++        self.seen
++            .retain(|_, event_ms| *event_ms >= now_ms - MAX_EVENT_AGE_MS);
++        if self.seen.len() >= MAX_SEEN_EVENTS || self.seen.contains_key(event_id) {
++            return Decision::Ignore;
++        }
++        self.seen.insert(event_id.to_owned(), timestamp_ms);
++
++        self.room_last_call
++            .retain(|_, last_call_ms| now_ms - *last_call_ms < ROOM_MODEL_COOLDOWN_MS);
++        if self.room_last_call.contains_key(room_id) {
++            return Decision::RoomLimited;
++        }
++        if !generation_available {
++            return Decision::Busy;
++        }
++        self.room_last_call.insert(room_id.to_owned(), now_ms);
++        Decision::Model
++    }
++}
++
++/// 拒绝启动、加入之前或断线补来的旧消息，也不执行未来时间的事件。
++pub(super) fn is_new(timestamp_ms: i64, started_at_ms: i64, joined_ms: i64, now_ms: i64) -> bool {
++    timestamp_ms > started_at_ms
++        && timestamp_ms > joined_ms
++        && (0..=MAX_EVENT_AGE_MS).contains(&now_ms.saturating_sub(timestamp_ms))
++}
++
++/// 付费网关各类拒绝仅反馈可操作原因，不把上游错误正文或凭据发回房间。
++pub(super) fn gateway_notice(status: Option<u16>) -> &'static str {
++    match status {
++        Some(403) => "本房间尚未启用该付费角色，或使用授权已撤销。",
++        Some(402) => "本房间的角色额度或余额不足。",
++        Some(429) => "模型服务调用太频繁，请稍后再试。",
++        _ => "角色暂时无法回复。",
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn paid_gateway_status_has_small_user_notice_and_no_body() {
++        assert_eq!(
++            gateway_notice(Some(403)),
++            "本房间尚未启用该付费角色，或使用授权已撤销。"
++        );
++        assert_eq!(gateway_notice(Some(402)), "本房间的角色额度或余额不足。");
++        assert_eq!(
++            gateway_notice(Some(429)),
++            "模型服务调用太频繁，请稍后再试。"
++        );
++        assert_eq!(gateway_notice(Some(401)), gateway_notice(Some(503)));
++        assert_eq!(gateway_notice(None), "角色暂时无法回复。");
++    }
++
++    #[test]
++    fn rate_is_per_room_and_busy_does_not_queue_or_charge() {
++        let mut state = Admission::default();
++        let a = "!a:example.com";
++        let b = "!b:example.com";
++        let now = 1_000_000;
++        assert_eq!(state.decide(a, "$a1", now, now, true), Decision::Model);
++        assert_eq!(
++            state.decide(a, "$a2", now, now + 1, true),
++            Decision::RoomLimited
++        );
++        assert_eq!(state.decide(b, "$b1", now, now + 1, false), Decision::Busy);
++        assert_eq!(state.decide(b, "$b1", now, now + 2, true), Decision::Ignore);
++        assert_eq!(state.decide(b, "$b2", now, now + 2, true), Decision::Model);
++        assert_eq!(
++            state.decide(a, "$a1", now, now + 10_000, true),
++            Decision::Ignore
++        );
++        assert_eq!(
++            state.decide(a, "$a3", now, now + 10_000, true),
++            Decision::Model
++        );
++    }
++
++    #[test]
++    fn only_events_after_start_and_join_in_live_window() {
++        let now = 1_000_000;
++        assert!(!is_new(now - 5, now - 5, now - 20, now));
++        assert!(!is_new(now - 5, now - 20, now - 5, now));
++        assert!(!is_new(now - MAX_EVENT_AGE_MS - 1, 0, 0, now));
++        assert!(!is_new(now + 1, 0, 0, now));
++        assert!(is_new(now - 1, now - 10, now - 5, now));
++        assert!(is_new(now - MAX_EVENT_AGE_MS, 0, 0, now));
++    }
++}
+diff --git a/src/bot/tavern_room.rs b/src/bot/tavern_room.rs
+new file mode 100644
+--- /dev/null
++++ b/src/bot/tavern_room.rs
+@@ -0,0 +1,126 @@
++use mxlink::matrix_sdk::{
++    Room, RoomState,
++    deserialized_responses::SyncOrStrippedState,
++    ruma::{
++        EventEncryptionAlgorithm, UserId,
++        events::{
++            SyncStateEvent,
++            room::{
++                encryption::RoomEncryptionEventContent,
++                join_rules::{JoinRule, RoomJoinRulesEventContent},
++                member::{MembershipState, RoomMemberEventContent},
++            },
++        },
++    },
++};
++
++/// 房间能加入和提供回复的条件一致：普通邀请制，并且使用现有 Matrix 端到端加密。
++fn is_private_encrypted(
++    rule: &RoomJoinRulesEventContent,
++    algorithm: Option<&EventEncryptionAlgorithm>,
++) -> bool {
++    matches!(&rule.join_rule, JoinRule::Invite)
++        && matches!(algorithm, Some(EventEncryptionAlgorithm::MegolmV1AesSha2))
++}
++
++/// 只读原生邀请快照。不完整或未知的快照不试加入。
++pub(super) async fn eligible_invitation(room: &Room) -> anyhow::Result<bool> {
++    if room.state() != RoomState::Invited {
++        return Ok(false);
++    }
++    let Some(rule) = room
++        .get_state_event_static::<RoomJoinRulesEventContent>()
++        .await?
++    else {
++        return Ok(false);
++    };
++    let Some(crypto) = room
++        .get_state_event_static::<RoomEncryptionEventContent>()
++        .await?
++    else {
++        return Ok(false);
++    };
++    let (SyncOrStrippedState::Stripped(rule), SyncOrStrippedState::Stripped(crypto)) =
++        (rule.deserialize()?, crypto.deserialize()?)
++    else {
++        return Ok(false);
++    };
++    Ok(is_private_encrypted(
++        &rule.content,
++        crypto.content.algorithm.as_ref(),
++    ))
++}
++
++/// 只读已同步的正式房间和 Bot 现有成员状态；没有资格或未加入时不交给模型。
++/// 返回成员状态时间，用来排除加入前已存在的消息，不回读聊天事件。
++pub(super) async fn joined_after(room: &Room, bot_mxid: &UserId) -> anyhow::Result<Option<i64>> {
++    if room.state() != RoomState::Joined || !room.is_synced() {
++        return Ok(None);
++    }
++    let Some(rule) = room
++        .get_state_event_static::<RoomJoinRulesEventContent>()
++        .await?
++    else {
++        return Ok(None);
++    };
++    let Some(crypto) = room
++        .get_state_event_static::<RoomEncryptionEventContent>()
++        .await?
++    else {
++        return Ok(None);
++    };
++    let (
++        SyncOrStrippedState::Sync(SyncStateEvent::Original(rule)),
++        SyncOrStrippedState::Sync(SyncStateEvent::Original(crypto)),
++    ) = (rule.deserialize()?, crypto.deserialize()?)
++    else {
++        return Ok(None);
++    };
++    if !is_private_encrypted(&rule.content, Some(&crypto.content.algorithm)) {
++        return Ok(None);
++    }
++    let Some(member) = room
++        .get_state_event_static_for_key::<RoomMemberEventContent, _>(bot_mxid)
++        .await?
++    else {
++        return Ok(None);
++    };
++    Ok(match member.deserialize()? {
++        SyncOrStrippedState::Sync(SyncStateEvent::Original(event))
++            if event.content.membership == MembershipState::Join =>
++        {
++            let timestamp: u64 = event.origin_server_ts.0.into();
++            i64::try_from(timestamp).ok()
++        }
++        _ => None,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_invite_only_with_megolm_qualifies() {
++        let megolm = RoomEncryptionEventContent::with_recommended_defaults();
++        let encrypted = |rule| {
++            is_private_encrypted(
++                &RoomJoinRulesEventContent::new(rule),
++                Some(&megolm.algorithm),
++            )
++        };
++        assert!(encrypted(JoinRule::Invite));
++        assert!(!encrypted(JoinRule::Public));
++        assert!(!encrypted(JoinRule::Knock));
++        assert!(!is_private_encrypted(
++            &RoomJoinRulesEventContent::new(JoinRule::Invite),
++            None
++        ));
++        let other_crypto =
++            RoomEncryptionEventContent::new(EventEncryptionAlgorithm::OlmV1Curve25519AesSha2);
++        assert!(!is_private_encrypted(
++            &RoomJoinRulesEventContent::new(JoinRule::Invite),
++            Some(&other_crypto.algorithm)
++        ));
++    }
++}
+diff --git a/src/controller/chat_completion/mod.rs b/src/controller/chat_completion/mod.rs
+index 26cff41..9de7829 100644
+--- a/src/controller/chat_completion/mod.rs
++++ b/src/controller/chat_completion/mod.rs
+@@ -549,6 +549,7 @@ async fn handle_stage_text_generation(
+             .text_generation_temperature_override(),
+ 
+         prompt_variables,
++        tavern_flux: None,
+     };
+ 
+     // When the thinking-notice is enabled, race generation against a timer that posts and then
+diff --git a/src/entity/cfg/config.rs b/src/entity/cfg/config.rs
+index a81afec..c2c5d91 100644
+--- a/src/entity/cfg/config.rs
++++ b/src/entity/cfg/config.rs
+@@ -411,13 +411,7 @@ impl ConfigAccess {
+     }
+ 
+     pub fn validate(&self) -> anyhow::Result<()> {
+-        if self.admin_patterns.is_empty() {
+-            return Err(anyhow::anyhow!(
+-                "The access.admin_patterns ({}) configuration must contain at least one pattern",
+-                super::env::BAIBOT_ACCESS_ADMIN_PATTERNS
+-            ));
+-        }
+-
++        // 酒馆试用不挂载管理员命令，空管理员列表是正常配置。
+         self.admin_pattern_regexes()?;
+ 
+         Ok(())

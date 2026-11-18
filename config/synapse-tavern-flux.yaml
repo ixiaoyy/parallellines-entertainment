@@ -1,0 +1,7 @@
+# 独立启用 Flux 邀请授权；不得整体覆盖原有 modules 列表。
+# 获准启用后将 enabled 改为 true，并配置固定 issuer_key_file:
+# /data/tavern-flux-issuer-key（Synapse UID/GID 991，0600，不在仓库保存凭据）。
+modules:
+  - module: data.tavern_flux.TavernFlux
+    config:
+      enabled: false

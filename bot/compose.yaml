@@ -1,0 +1,37 @@
+# 独立于原生聊天栈；本文件只能用本次已审的机器人镜像单独启动。
+services:
+  role-bot:
+    image: "${TAVERN_BOT_IMAGE:?须指定已审核的不可变机器人镜像}"
+    platform: linux/amd64
+    user: "${TAVERN_BOT_UID:?须指定机器人专用非 root UID}:${TAVERN_BOT_GID:?须指定机器人专用非 root GID}"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      # 两处路径只来自管理员导入产物，不从角色卡接受外部文件或镜像名。
+      - type: bind
+        source: "../runtime/bot/${TAVERN_ROLE_ID:?须提供已准备的角色}/config.yml"
+        target: /app/config.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "../runtime/bot/${TAVERN_ROLE_ID:?须提供已准备的角色}"
+        target: /role
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "../data/bot/${TAVERN_ROLE_ID:?须提供已准备的角色}"
+        target: /data
+        bind:
+          create_host_path: false
+    tmpfs: [/tmp:rw,noexec,nosuid,size=16m]
+    mem_limit: 256m
+    cpus: '0.5'
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: '2'
