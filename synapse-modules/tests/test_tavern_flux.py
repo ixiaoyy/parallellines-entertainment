@@ -58,6 +58,8 @@ ROOM_A = "!roomA:matrix.pingxingxian.space"
 ROOM_B = "!roomB:matrix.pingxingxian.space"
 ALICE = "@alice:matrix.pingxingxian.space"
 BOB = "@bob:matrix.pingxingxian.space"
+LUNA = "gpt-6-luna"
+TERRA = "gpt-6.1-terra"
 
 
 def event(event_type, room, key="", sender=ALICE, event_id="$test", replaces=None, **content):
@@ -126,6 +128,17 @@ class FakeGateway:
 
     async def request(self, method, url, body=None):
         self.calls.append((method, url, body))
+        if method == "POST" and url in (flux.MODEL_OPTIONS, flux.SET_MODEL):
+            grant = next((x for x in self.intents.values() if x["room_id"] == body["room_id"] and x["status"] == "active"), None)
+            if grant is not None and (grant["inviter_mxid"] != body["inviter_mxid"] or grant["subject"] != body["subject"]):
+                flux.forbidden()
+            if url == flux.MODEL_OPTIONS:
+                return {"options": [{"id": LUNA, "label": "Luna"}, {"id": TERRA, "label": "Terra"}],
+                        "selected_model_id": grant.get("model_id", LUNA) if grant else LUNA, "can_edit": grant is not None}
+            if grant is None or grant.get("model_id", LUNA) != body["expected_model_id"]:
+                flux.reject(409, "M_TAVERN_FLUX_MODEL_CHANGED")
+            grant["model_id"] = body["model_id"]
+            return {"model_id": grant["model_id"]}
         if method == "POST" and url == flux.INTENTS:
             key = "synthetic-intent-token-" + str(len(self.intents) + 1)
             self.intents[key] = {**body, "intent_id": key, "status": "pending"}
@@ -249,6 +262,63 @@ class FluxContractTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(invites.InviteError) as fail:
                     await gw.request("POST", flux.ONE_CLICK_INTENT, {})
             self.assertEqual((fail.exception.status, fail.exception.errcode), (want_status, code))
+
+    async def test_model_options_do_not_create_authorization_and_invite_forwards_selected_model(self):
+        value = await self.module.model_options(ALICE, {"room_id": ROOM_A})
+        self.assertEqual((value["selected_model_id"], value["can_edit"]), (LUNA, False))
+        self.assertEqual(self.module.gateway.intents, {})
+        self.assertEqual(self.module.api.sent, [])
+        invitation = {**self.invite_body(), "model_id": TERRA}
+        self.assertEqual(await self.module.invite(ALICE, invitation), {"status": "active"})
+        _, route, sent = self.module.gateway.calls[-2]
+        self.assertEqual((route, sent["model_id"], sent["subject"]), (flux.ONE_CLICK_INTENT, TERRA, "verified-A"))
+        await self.module.invite(BOB, self.invite_body(ROOM_B))
+        self.assertNotIn("model_id", self.module.gateway.calls[-2][2])
+        self.assertEqual((await self.module.model_options(ALICE, {"room_id": ROOM_A}))["selected_model_id"], TERRA)
+        self.assertEqual((await self.module.model_options(BOB, {"room_id": ROOM_B}))["selected_model_id"], LUNA)
+
+    async def test_model_edits_only_apply_to_own_existing_room_even_without_invite_power(self):
+        await self.module.invite(ALICE, self.invite_body())
+        await self.module.invite(BOB, self.invite_body(ROOM_B))
+        setting = {"room_id": ROOM_A, "model_id": TERRA, "expected_model_id": LUNA}
+        room = self.module.api.rooms[ROOM_A]
+        room[(flux.EventTypes.Member, BOB)] = event(flux.EventTypes.Member, ROOM_A, BOB, membership="join")
+        room[(flux.EventTypes.PowerLevels, "")] = event(flux.EventTypes.PowerLevels, ROOM_A, invite=50,
+                                                       **{ALICE: 0, BOB: 100})
+        calls = len(self.module.gateway.calls)
+        for action, body in ((self.module.model_options, {"room_id": ROOM_A}), (self.module.set_model, setting)):
+            with self.assertRaises(invites.InviteError) as denied:
+                await action(BOB, body)
+            self.assertEqual(denied.exception.status, 403)
+        self.assertEqual(len(self.module.gateway.calls), calls)
+        for invalid in ({**setting, "subject": "spoof"}, {**setting, "model_id": "model?evil"},
+                        {**setting, "expected_model_id": None}):
+            with self.assertRaises(invites.InviteError) as malformed:
+                await self.module.set_model(ALICE, invalid)
+            self.assertEqual(malformed.exception.status, 400)
+        self.assertEqual(await self.module.set_model(ALICE, setting), {"model_id": TERRA})
+        _, route, sent = self.module.gateway.calls[-1]
+        self.assertEqual((route, sent), (flux.SET_MODEL, {**setting, "inviter_mxid": ALICE, "subject": "verified-A"}))
+        with self.assertRaises(invites.InviteError) as stale:
+            await self.module.set_model(ALICE, setting)
+        self.assertEqual(stale.exception.errcode, "M_TAVERN_FLUX_MODEL_CHANGED")
+        self.assertEqual((await self.module.model_options(BOB, {"room_id": ROOM_B}))["selected_model_id"], LUNA)
+        room.pop((flux.EventTypes.Member, flux.FLUX))
+        with self.assertRaises(invites.InviteError) as left:
+            await self.module.set_model(ALICE, {**setting, "expected_model_id": TERRA})
+        self.assertEqual(left.exception.status, 409)
+
+    async def test_model_options_rejects_malformed_metadata_instead_of_defaulting(self):
+        for response in ({"options": None, "selected_model_id": "", "can_edit": False},
+                         {"options": [{"id": LUNA, "label": "Luna"}], "selected_model_id": TERRA, "can_edit": False},
+                         {"options": [{"id": LUNA, "label": "Bad\nvalue"}], "selected_model_id": LUNA,
+                          "can_edit": True}):
+            async def raw(*_args):
+                return response
+            with patch.object(self.module.gateway, "request", raw):
+                with self.assertRaises(invites.InviteError) as rejected:
+                    await self.module.model_options(ALICE, {"room_id": ROOM_A})
+                self.assertEqual(rejected.exception.status, 503)
 
     async def test_pending_has_no_invite_confirmed_activates_native_event_once(self):
         key = await self.prepare()

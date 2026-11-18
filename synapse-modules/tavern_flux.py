@@ -25,6 +25,7 @@ from .tavern_invites import (
     InviteResource,
     TavernInvites,
     invite_allowed,
+    invite_room,
     no_duplicate_keys,
     reject,
     room_id_valid,
@@ -35,6 +36,8 @@ ROUTE = "/_synapse/client/tavern-flux/v1"
 NEW_API = "https://api.pingxingxian.space"
 INTENTS = f"{NEW_API}/api/tavern-flux/intents"
 ONE_CLICK_INTENT = f"{INTENTS}/invite"
+MODEL_OPTIONS = f"{INTENTS}/model-options"
+SET_MODEL = f"{INTENTS}/set-model"
 AUTHORIZATION_PAGE = f"{NEW_API}/tavern-flux/authorize?intent_id="
 OIDC_PROVIDER = "oidc-parallellines"
 FLUX = f"@bot_flux-the-cat:{HOMESERVER}"
@@ -44,6 +47,7 @@ KEY_FILE = Path("/data/tavern-flux-issuer-key")
 KEY = re.compile(rb"[A-Za-z0-9._~-]{32,256}\Z")
 INTENT = re.compile(r"[A-Za-z0-9_-]{22,128}\Z")
 REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 NONCE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 EVENT_ID = re.compile(r"\$[!-~]{1,254}\Z")
 GATEWAY_TIMEOUT = 6
@@ -65,15 +69,24 @@ def state_changed():
     reject(409, "M_TAVERN_FLUX_STATE_CHANGED")
 
 
-def private_encrypted_room(events, inviter):
-    """只认明确邀请制与原生 Megolm；普通成员/其他 Bot 不走本判断。"""
+def private_encrypted_chat(events):
+    """只有明确邀请制支持 Megolm 的普通房间可使用付费角色。"""
     rule = events.get((EventTypes.JoinRules, ""))
     crypto = events.get((EventTypes.RoomEncryption, ""))
     return bool(
-        rule is not None and rule.content.get("join_rule") == JoinRules.INVITE
+        invite_room(events) and rule is not None and rule.content.get("join_rule") == JoinRules.INVITE
         and crypto is not None and crypto.content.get("algorithm") == "m.megolm.v1.aes-sha2"
-        and invite_allowed(events, inviter, FLUX)
     )
+
+
+def private_encrypted_room(events, inviter):
+    """新邀请必须同时通过房间性质和原生邀请权限；其他 Bot 不走本判断。"""
+    return private_encrypted_chat(events) and invite_allowed(events, inviter, FLUX)
+
+
+def model_id_valid(value):
+    """只接收网关可核对的精确模型标识，不允许客户端传渠道、价格或付款人。"""
+    return isinstance(value, str) and bool(MODEL_ID.fullmatch(value))
 
 
 def room_label(events, room_id):
@@ -121,16 +134,23 @@ class FluxGateway:
             unavailable()
         if status == 404:
             reject(404, "M_TAVERN_FLUX_INTENT_NOT_FOUND")
-        if status == 409:
-            state_changed()
         if status == 429:
             reject(429, "M_LIMIT_EXCEEDED")
-        if url == ONE_CLICK_INTENT and isinstance(value, dict):
+        if url in (ONE_CLICK_INTENT, MODEL_OPTIONS, SET_MODEL) and isinstance(value, dict):
             # 只映射固定签发入口的约定错误；不把上游内容或钱包信息交给浏览器。
-            if status == 400 and value.get("error") == "flux_invalid_quota_limit":
+            code = value.get("error")
+            if status == 400 and code == "flux_invalid_quota_limit":
                 reject(400, "M_TAVERN_FLUX_LIMIT_INVALID")
-            if status == 403 and value.get("error") == "flux_wallet_unavailable":
+            if status == 403 and code == "flux_wallet_unavailable":
                 reject(403, "M_TAVERN_FLUX_WALLET_UNAVAILABLE")
+            if status == 403 and code == "flux_authorization_denied":
+                forbidden()
+            if status == 409 and code == "flux_model_changed":
+                reject(409, "M_TAVERN_FLUX_MODEL_CHANGED")
+            if status == 409 and code == "flux_model_unavailable":
+                reject(409, "M_TAVERN_FLUX_MODEL_UNAVAILABLE")
+        if status == 409:
+            state_changed()
         if status not in (200, 201) or not isinstance(value, dict):
             unavailable()
         return value
@@ -144,9 +164,11 @@ class FluxGateway:
             data = json.dumps(body, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         response = await self.client.request(method, url, data=data, headers=headers)
         buffer = BytesIO()
-        # 即使上游返回错误也消费有界正文；仅新签发入口解释约定的失败码。
+        # 即使上游返回错误也消费有界正文；仅确认和模型接口解释约定失败码。
         await read_body_with_max_size(response, buffer, MAX_GATEWAY_BYTES)
-        if response.code not in (200, 201) and (url != ONE_CLICK_INTENT or response.code not in (400, 403)):
+        if response.code not in (200, 201) and (
+            url not in (ONE_CLICK_INTENT, MODEL_OPTIONS, SET_MODEL) or response.code not in (400, 403, 409)
+        ):
             return response.code, None
         content_type = response.headers.getRawHeaders(b"Content-Type", [])
         if len(content_type) != 1 or content_type[0].split(b";", 1)[0].strip().lower() != b"application/json":
@@ -180,8 +202,8 @@ class TavernFlux:
         self.gateway = FluxGateway(api, private_issuer_key(KEY_FILE))
         self.finishing_rooms = set()
         self.issuing_invites = set()
-        for action in ("prepare", "finish", "invite"):
-            path = f"{ROUTE}/{action}"
+        for action in ("prepare", "finish", "invite", "model_options", "set_model"):
+            path = f"{ROUTE}/{action.replace('_', '-')}"
             # 复用固定 Element Origin、Matrix bearer、有界 JSON 及 no-store 处理。
             api.register_web_resource(path, InviteResource(self, path, action))
         api.register_third_party_rules_callbacks(check_event_allowed=self.check_flux_invite)
@@ -211,16 +233,78 @@ class TavernFlux:
             forbidden()
         return subject
 
-    async def room_state(self, room_id, inviter):
-        """查询只包含决定付款、房间资格及该角色成员状态所需事件。"""
-        events = await self.api.get_room_state(room_id, (
+    async def room_events(self, room_id, inviter):
+        """只取房间资格、邀请权及该角色成员状态所需事件。"""
+        return await self.api.get_room_state(room_id, (
             (EventTypes.Create, ""), (EventTypes.JoinRules, ""), (EventTypes.RoomEncryption, ""),
             (EventTypes.PowerLevels, ""), (EventTypes.Name, ""),
             (EventTypes.Member, inviter), (EventTypes.Member, FLUX),
         ))
+
+    async def room_state(self, room_id, inviter):
+        """要求当前用户具备新发 Flux 邀请的房间与原生权限。"""
+        events = await self.room_events(room_id, inviter)
         if not private_encrypted_room(events, inviter):
             forbidden()
         return events
+
+    async def model_room(self, room_id, inviter, set_model=False):
+        """只有原邀请人可改已在房的 Flux；单纯查看邀请选项仍须有原生邀请权。"""
+        events = await self.room_events(room_id, inviter)
+        sender = events.get((EventTypes.Member, inviter))
+        if not private_encrypted_chat(events) or sender is None or sender.content.get("membership") != Membership.JOIN:
+            forbidden()
+        member = events.get((EventTypes.Member, FLUX))
+        if member is not None and member.content.get("membership") in (Membership.INVITE, Membership.JOIN):
+            event = await self.last_invite(member, room_id)
+            intent = event.content.get(MARKER) if event is not None else None
+            if not isinstance(intent, str) or not INTENT.fullmatch(intent) or not self.matches_invite(event, inviter, room_id, intent):
+                forbidden()
+        elif set_model:
+            state_changed()
+        elif not invite_allowed(events, inviter, FLUX):
+            forbidden()
+
+    async def model_options(self, inviter, body):
+        """由网关按当前付款人列出可用模型；读选项不建授权也不扣费。"""
+        room_id = body.get("room_id")
+        if set(body) != {"room_id"} or not room_id_valid(room_id):
+            reject(400, "M_INVALID_PARAM")
+        await self.model_room(room_id, inviter)
+        value = await self.gateway.request("POST", MODEL_OPTIONS, {
+            "room_id": room_id, "inviter_mxid": inviter, "subject": await self.subject(inviter),
+        })
+        options, current, editable = value.get("options"), value.get("selected_model_id"), value.get("can_edit")
+        if (set(value) != {"options", "selected_model_id", "can_edit"} or not isinstance(options, list)
+                or len(options) > 16 or type(editable) is not bool
+                or not (model_id_valid(current) or (current == "" and not editable))):
+            unavailable()
+        ids = set()
+        for option in options:
+            if (not isinstance(option, dict) or set(option) != {"id", "label"}
+                    or not model_id_valid(option["id"]) or option["id"] in ids
+                    or not isinstance(option["label"], str) or not 1 <= len(option["label"]) <= 96
+                    or any(unicodedata.category(c).startswith("C") for c in option["label"])):
+                unavailable()
+            ids.add(option["id"])
+        if current and not editable and current not in ids:
+            unavailable()
+        return value
+
+    async def set_model(self, inviter, body):
+        """只更改同房原授权的模型；网关负责精确钱包归属及并发检查。"""
+        room_id, model_id, expected = (body.get(key) for key in ("room_id", "model_id", "expected_model_id"))
+        if (set(body) != {"room_id", "model_id", "expected_model_id"} or not room_id_valid(room_id)
+                or not model_id_valid(model_id) or not model_id_valid(expected)):
+            reject(400, "M_INVALID_PARAM")
+        await self.model_room(room_id, inviter, set_model=True)
+        value = await self.gateway.request("POST", SET_MODEL, {
+            "room_id": room_id, "inviter_mxid": inviter, "subject": await self.subject(inviter),
+            "model_id": model_id, "expected_model_id": expected,
+        })
+        if value != {"model_id": model_id}:
+            unavailable()
+        return value
 
     async def prepare(self, inviter, body):
         """仅签发待确认意图，不发送原生邀请或启用费用。"""
@@ -259,19 +343,24 @@ class TavernFlux:
     async def invite(self, inviter, body):
         """用当前 Matrix 登录人完成一次费用确认和邀请；重试只复用同一个授权。"""
         room_id, request_id, limit = (body.get(key) for key in ("room_id", "request_id", "limit_usd_micros"))
-        if (set(body) != {"room_id", "request_id", "limit_usd_micros"} or not room_id_valid(room_id)
+        required = {"room_id", "request_id", "limit_usd_micros"}
+        if (set(body) not in (required, required | {"model_id"}) or not room_id_valid(room_id)
                 or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id)
-                or type(limit) is not int or not 0 <= limit <= MAX_SAFE_INTEGER):
+                or type(limit) is not int or not 0 <= limit <= MAX_SAFE_INTEGER
+                or ("model_id" in body and not model_id_valid(body["model_id"]))):
             reject(400, "M_INVALID_PARAM")
         self.claim_room(room_id)
         try:
             subject = await self.subject(inviter)
             events = await self.room_state(room_id, inviter)
             # 只传原生账号映射和已确认的费用选项；0 不设房间金额上限，钱包扣费仍由网关限制。
-            value = await self.gateway.request("POST", ONE_CLICK_INTENT, {
+            request = {
                 "room_id": room_id, "inviter_mxid": inviter, "subject": subject,
                 "room_label": room_label(events, room_id), "request_id": request_id, "limit_usd_micros": limit,
-            })
+            }
+            if "model_id" in body:
+                request["model_id"] = body["model_id"]
+            value = await self.gateway.request("POST", ONE_CLICK_INTENT, request)
             intent, status = value.get("intent_id"), value.get("status")
             if not isinstance(intent, str) or not INTENT.fullmatch(intent) or status not in ("confirmed", "active"):
                 unavailable()

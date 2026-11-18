@@ -142,8 +142,8 @@ def invite_dialog(source):
     data = replace_once(
         data,
         "    private inviteUsers = async (): Promise<void> => {",
-        '''    // 在弹窗生命周期保存同金额请求 ID；切换身份提醒界面也不重新签发。
-    private readonly fluxRequestIds = new Map<number, string>();
+        '''    // 同一弹窗内，模型和金额完全匹配的邀请重试沿用原请求 ID。
+    private readonly fluxRequestIds = new Map<string, string>();
 
     private onFluxInviteComplete = (): void => {
         const targets = this.state.targets.filter((member) => !isPaidTavernRole(member.userId));
@@ -386,6 +386,27 @@ def invite_dialog(source):
     return relative, data
 
 
+def room_header(source):
+    """把 Flux 模型入口接到真实房间标题，保留已有按钮和布局。"""
+    relative = WEB + "components/views/rooms/RoomHeader/RoomHeader.tsx"
+    data = source_file(source, relative)
+    data = replace_once(
+        data,
+        'import { SDKContext } from "../../../../contexts/SDKContext.ts";',
+        'import { SDKContext } from "../../../../contexts/SDKContext.ts";\n'
+        'import { TavernFluxRoomModelButton } from "../../../../utils/tavern-invite/FluxFunding";',
+        relative,
+    )
+    data = replace_once(
+        data,
+        '            {extraButtons}\n',
+        '            {extraButtons}\n'
+        '            {sdkContext.client && <TavernFluxRoomModelButton client={sdkContext.client} room={room} />}\n',
+        relative,
+    )
+    return relative, data
+
+
 def plan(source):
     if git(source, "rev-parse", "HEAD").decode().strip() != REVISION:
         raise ValueError("Element checkout must match the locked revision")
@@ -395,7 +416,7 @@ def plan(source):
     directory = source / WEB / "utils/tavern-invite"
     if directory.exists() or directory.is_symlink():
         raise ValueError("Tavern overlay target already exists; use a fresh checkout")
-    replacements = dict([startup(source), ready_view(source), invite_dialog(source)])
+    replacements = dict([startup(source), ready_view(source), invite_dialog(source), room_header(source)])
     additions = {name: (OVERLAY / "src" / name).read_text(encoding="utf-8")
                  for name in ("pending.ts", "RoomInvites.tsx", "FluxFunding.tsx")}
     return directory, replacements, additions
