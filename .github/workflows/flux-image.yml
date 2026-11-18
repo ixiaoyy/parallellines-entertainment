@@ -1,0 +1,97 @@
+name: Build Flux image
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: flux-image-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'ixiaoyy/parallellines-entertainment' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/ixiaoyy/parallellines-entertainment-flux
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+      digest: ${{ steps.publish.outputs.digest }}
+      commit: ${{ steps.publish.outputs.commit }}
+    steps:
+      - name: Checkout the dispatched commit
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build and verify the Linux amd64 image offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && "$(uname -m)" == x86_64 ]]
+          context=bot/baibot
+          for file in Dockerfile strict-room-mentions.patch .dockerignore; do
+            test -f "$context/$file"
+            test ! -L "$context/$file"
+          done
+          # 构建上下文只允许正式配方、补丁及白名单本身，不接角色卡或运行产物。
+          printf '*\n!Dockerfile\n!strict-room-mentions.patch\n' | cmp -s - "$context/.dockerignore"
+          version="$(sed -n 's/^ENV BAIBOT_VERSION=//p' "$context/Dockerfile")"
+          [[ "$version" =~ ^[0-9.]+-tavern\.[0-9]+$ ]]
+          tag="$IMAGE:$GITHUB_SHA"
+          docker buildx build --platform linux/amd64 --load --progress plain \
+            --label "org.opencontainers.image.source=https://github.com/ixiaoyy/parallellines-entertainment" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$tag" "$context"
+
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}}' "$tag")" = 'linux/amd64 65532:65532'
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$tag")" = '["/app/baibot"]'
+          docker image inspect --format '{{json .Config.Env}}' "$tag" | jq -e 'all(.[]?; startswith("PATH="))' >/dev/null
+          # 不挂载主机文件或连网：执行真实二进制版本入口，但不启动 Bot 会话或模型请求。
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges=true --entrypoint /bin/sh "$tag" -eu -c '
+              test "$(id -u):$(id -g)" = 65532:65532
+              test "$(ls -A /app)" = baibot
+              test -x /app/baibot
+              test -f /usr/share/doc/tavern-baibot/LICENSE
+              test ! -e /role && test ! -e /data && test ! -e /run/secrets
+              test "$(/app/baibot --version)" = "$1"
+            ' _ "baibot $version"
+
+      - name: Publish verified image and record its digest
+        id: publish
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:$GITHUB_SHA"
+          DOCKER_CONFIG="$(mktemp -d "$RUNNER_TEMP/flux-docker.XXXXXX")"
+          export DOCKER_CONFIG
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          unset GHCR_TOKEN
+          # 只发布经此 job 实测的提交标签；不推 latest，不调整 Package 可见性。
+          push_log="$(mktemp "$RUNNER_TEMP/flux-push.XXXXXX")"
+          docker push "$tag" | tee "$push_log"
+          digest="$(sed -nE 's/.*digest: (sha256:[a-f0-9]{64}) size: [0-9]+$/\1/p' "$push_log")"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          test "$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}')" = "$digest"
+          {
+            printf 'image=%s@%s\n' "$IMAGE" "$digest"
+            printf 'digest=%s\ncommit=%s\n' "$digest" "$GITHUB_SHA"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '### Flux image (linux/amd64)'
+            printf -- '- Commit: %s\n' "$GITHUB_SHA"
+            printf -- '- Tag: %s\n' "$tag"
+            printf -- '- Immutable pull reference: %s@%s\n' "$IMAGE" "$digest"
+          } >> "$GITHUB_STEP_SUMMARY"
