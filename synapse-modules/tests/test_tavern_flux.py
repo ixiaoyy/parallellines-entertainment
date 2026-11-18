@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -129,6 +130,14 @@ class FakeGateway:
             key = "synthetic-intent-token-" + str(len(self.intents) + 1)
             self.intents[key] = {**body, "intent_id": key, "status": "pending"}
             return {"intent_id": key, "status": "pending"}
+        if method == "POST" and url == flux.ONE_CLICK_INTENT:
+            # 合成签发方只记录受信调用，同房同次请求保持同一个授权。
+            key = hashlib.sha256(json.dumps([body["room_id"], body["inviter_mxid"], body["request_id"]]).encode()).hexdigest()
+            entry = self.intents.setdefault(key, {**body, "intent_id": key, "status": "confirmed"})
+            if (entry["subject"] != body["subject"] or entry["limit_usd_micros"] != body["limit_usd_micros"]
+                    or entry["status"] not in ("confirmed", "active")):
+                flux.state_changed()
+            return {"intent_id": key, "status": entry["status"]}
         key = url.removeprefix(flux.INTENTS + "/").removesuffix("/activate")
         value = self.intents[key]
         if method == "GET":
@@ -158,6 +167,88 @@ class FluxContractTest(unittest.IsolatedAsyncioTestCase):
 
     async def finish(self, intent, user=ALICE, room=ROOM_A):
         return await self.module.finish(user, {"room_id": room, "intent_id": intent})
+
+    @staticmethod
+    def invite_body(room=ROOM_A, limit=0, request_id="e" * 32):
+        return {"room_id": room, "request_id": request_id, "limit_usd_micros": limit}
+
+    async def test_one_click_passes_zero_and_custom_to_only_the_matching_wallet_issuer(self):
+        for user, room, limit, subject in ((ALICE, ROOM_A, 0, "verified-A"), (BOB, ROOM_B, 12_500, "verified-B")):
+            self.assertEqual(await self.module.invite(user, self.invite_body(room, limit)), {"status": "active"})
+            _, url, signed = self.module.gateway.calls[-2]
+            self.assertEqual(url, flux.ONE_CLICK_INTENT)
+            self.assertEqual(signed, {**self.invite_body(room, limit), "inviter_mxid": user,
+                                      "subject": subject, "room_label": "合成房间"})
+        self.assertEqual([(e.room_id, e.sender) for e in self.module.api.sent], [(ROOM_A, ALICE), (ROOM_B, BOB)])
+        self.assertEqual(len(self.module.gateway.intents), 2)
+        self.assertEqual(self.module.finishing_rooms, set())
+
+    async def test_one_click_retries_same_room_event_and_does_not_replace_the_selection(self):
+        call = self.invite_body()
+        self.module.gateway.drop_activate = True
+        with self.assertRaises(TimeoutError):
+            await self.module.invite(ALICE, call)
+        original = self.module.api.sent[0]
+        self.module.api.rooms[ROOM_A][(flux.EventTypes.Member, flux.FLUX)] = event(
+            flux.EventTypes.Member, ROOM_A, flux.FLUX, flux.FLUX, "$joined", original.event_id, membership="join",
+        )
+        self.module.gateway.drop_activate = False
+        self.assertEqual(await self.module.invite(ALICE, call), {"status": "active"})
+        self.assertEqual(await self.module.invite(ALICE, call), {"status": "active"})
+        for changed in ({**call, "limit_usd_micros": 100_000}, {**call, "request_id": "b" * 32}):
+            with self.assertRaises(invites.InviteError) as conflict:
+                await self.module.invite(ALICE, changed)
+            self.assertEqual(conflict.exception.status, 409)
+        self.assertEqual(len(self.module.api.sent), 1)
+        self.assertEqual(self.module.gateway.intents[original.content[flux.MARKER]]["invite_event_id"], original.event_id)
+
+    async def test_one_click_rejects_invalid_request_and_room_before_issuer_or_membership(self):
+        valid = self.invite_body()
+        resource = invites.InviteResource(self.module, f"{flux.ROUTE}/invite", "invite")
+        for body in (dict(room_id=ROOM_A, request_id="e" * 32), {**valid, "subject": "fake"},
+                     {**valid, "request_id": "x" * 32}, *(self.invite_body(limit=n) for n in (False, None, -1, 0.0, 1 << 53))):
+            request = FakeRequest("invite", json.dumps(body).encode())
+            request.uri = f"{flux.ROUTE}/invite".encode()
+            with self.assertRaises(invites.InviteError) as malformed:
+                await resource._async_render_POST(request)
+            self.assertEqual(malformed.exception.status, 400)
+        for user, room in ((ALICE, ROOM_B), (BOB, ROOM_A)):
+            with self.assertRaises(invites.InviteError) as denied:
+                await self.module.invite(user, self.invite_body(room))
+            self.assertEqual(denied.exception.status, 403)
+        request = FakeRequest("invite", json.dumps(valid).encode(), origin=[b"https://other.test"])
+        request.uri = f"{flux.ROUTE}/invite".encode()
+        with self.assertRaises(invites.InviteError) as cross_origin:
+            await resource._async_render_POST(request)
+        self.assertEqual(cross_origin.exception.status, 403)
+        self.assertEqual(self.module.gateway.calls, [])
+        self.assertEqual(self.module.api.sent, [])
+
+    async def test_one_click_requires_a_confirmed_receipt(self):
+        for reply in ({"intent_id": "a" * 64, "status": "pending"}, {"intent_id": "short", "status": "confirmed"}):
+            async def raw(*_args):
+                return reply
+            with patch.object(self.module.gateway, "request", raw):
+                with self.assertRaises(invites.InviteError) as unavailable:
+                    await self.module.invite(ALICE, self.invite_body())
+                self.assertEqual(unavailable.exception.status, 503)
+        self.assertEqual(self.module.api.sent, [])
+
+    async def test_one_click_gateway_exposes_only_approved_error_codes(self):
+        gw = flux.FluxGateway.__new__(flux.FluxGateway)
+        for state, received, want_status, code in (
+            (400, {"error": "flux_invalid_quota_limit"}, 400, "M_TAVERN_FLUX_LIMIT_INVALID"),
+            (403, {"error": "flux_wallet_unavailable", "private": "not exposed"}, 403,
+             "M_TAVERN_FLUX_WALLET_UNAVAILABLE"),
+            (403, {"error": "issuer credential failure"}, 503, "M_TAVERN_FLUX_GATEWAY_UNAVAILABLE"),
+            (409, None, 409, "M_TAVERN_FLUX_STATE_CHANGED"),
+        ):
+            async def raw(*_args):
+                return state, received
+            with patch.object(gw, "request_response", raw):
+                with self.assertRaises(invites.InviteError) as fail:
+                    await gw.request("POST", flux.ONE_CLICK_INTENT, {})
+            self.assertEqual((fail.exception.status, fail.exception.errcode), (want_status, code))
 
     async def test_pending_has_no_invite_confirmed_activates_native_event_once(self):
         key = await self.prepare()

@@ -34,6 +34,7 @@ from .tavern_invites import (
 ROUTE = "/_synapse/client/tavern-flux/v1"
 NEW_API = "https://api.pingxingxian.space"
 INTENTS = f"{NEW_API}/api/tavern-flux/intents"
+ONE_CLICK_INTENT = f"{INTENTS}/invite"
 AUTHORIZATION_PAGE = f"{NEW_API}/tavern-flux/authorize?intent_id="
 OIDC_PROVIDER = "oidc-parallellines"
 FLUX = f"@bot_flux-the-cat:{HOMESERVER}"
@@ -42,12 +43,14 @@ ISSUE_NONCE = "space.pingxingxian.tavern_flux_issue"
 KEY_FILE = Path("/data/tavern-flux-issuer-key")
 KEY = re.compile(rb"[A-Za-z0-9._~-]{32,256}\Z")
 INTENT = re.compile(r"[A-Za-z0-9_-]{22,128}\Z")
+REQUEST_ID = re.compile(r"[0-9a-f]{32}\Z")
 NONCE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 EVENT_ID = re.compile(r"\$[!-~]{1,254}\Z")
 GATEWAY_TIMEOUT = 6
 MAX_GATEWAY_BYTES = 8192
 MAX_ACTIVE_FINISH = 32
 MAX_MEMBERSHIP_LOOKBACK = 8
+MAX_SAFE_INTEGER = (1 << 53) - 1
 
 
 def forbidden():
@@ -122,6 +125,12 @@ class FluxGateway:
             state_changed()
         if status == 429:
             reject(429, "M_LIMIT_EXCEEDED")
+        if url == ONE_CLICK_INTENT and isinstance(value, dict):
+            # 只映射固定签发入口的约定错误；不把上游内容或钱包信息交给浏览器。
+            if status == 400 and value.get("error") == "flux_invalid_quota_limit":
+                reject(400, "M_TAVERN_FLUX_LIMIT_INVALID")
+            if status == 403 and value.get("error") == "flux_wallet_unavailable":
+                reject(403, "M_TAVERN_FLUX_WALLET_UNAVAILABLE")
         if status not in (200, 201) or not isinstance(value, dict):
             unavailable()
         return value
@@ -135,9 +144,9 @@ class FluxGateway:
             data = json.dumps(body, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         response = await self.client.request(method, url, data=data, headers=headers)
         buffer = BytesIO()
-        # 即使是上游错误也只消费有界正文以释放连接，不读取或回显错误信息。
+        # 即使上游返回错误也消费有界正文；仅新签发入口解释约定的失败码。
         await read_body_with_max_size(response, buffer, MAX_GATEWAY_BYTES)
-        if response.code not in (200, 201):
+        if response.code not in (200, 201) and (url != ONE_CLICK_INTENT or response.code not in (400, 403)):
             return response.code, None
         content_type = response.headers.getRawHeaders(b"Content-Type", [])
         if len(content_type) != 1 or content_type[0].split(b";", 1)[0].strip().lower() != b"application/json":
@@ -171,7 +180,7 @@ class TavernFlux:
         self.gateway = FluxGateway(api, private_issuer_key(KEY_FILE))
         self.finishing_rooms = set()
         self.issuing_invites = set()
-        for action in ("prepare", "finish"):
+        for action in ("prepare", "finish", "invite"):
             path = f"{ROUTE}/{action}"
             # 复用固定 Element Origin、Matrix bearer、有界 JSON 及 no-store 处理。
             api.register_web_resource(path, InviteResource(self, path, action))
@@ -235,11 +244,38 @@ class TavernFlux:
         if (set(body) != {"room_id", "intent_id"} or not room_id_valid(room_id)
                 or not isinstance(intent, str) or not INTENT.fullmatch(intent)):
             reject(400, "M_INVALID_PARAM")
+        self.claim_room(room_id)
+        try:
+            return await self.finish_room(inviter, room_id, intent)
+        finally:
+            self.finishing_rooms.remove(room_id)
+
+    def claim_room(self, room_id):
+        """串行处理同一房间的新旧签发入口，并限制同时处理的房间数。"""
         if room_id in self.finishing_rooms or len(self.finishing_rooms) >= MAX_ACTIVE_FINISH:
             reject(429, "M_LIMIT_EXCEEDED")
         self.finishing_rooms.add(room_id)
+
+    async def invite(self, inviter, body):
+        """用当前 Matrix 登录人完成一次费用确认和邀请；重试只复用同一个授权。"""
+        room_id, request_id, limit = (body.get(key) for key in ("room_id", "request_id", "limit_usd_micros"))
+        if (set(body) != {"room_id", "request_id", "limit_usd_micros"} or not room_id_valid(room_id)
+                or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id)
+                or type(limit) is not int or not 0 <= limit <= MAX_SAFE_INTEGER):
+            reject(400, "M_INVALID_PARAM")
+        self.claim_room(room_id)
         try:
-            return await self.finish_room(inviter, room_id, intent)
+            subject = await self.subject(inviter)
+            events = await self.room_state(room_id, inviter)
+            # 只传原生账号映射和已确认的费用选项；0 不设房间金额上限，钱包扣费仍由网关限制。
+            value = await self.gateway.request("POST", ONE_CLICK_INTENT, {
+                "room_id": room_id, "inviter_mxid": inviter, "subject": subject,
+                "room_label": room_label(events, room_id), "request_id": request_id, "limit_usd_micros": limit,
+            })
+            intent, status = value.get("intent_id"), value.get("status")
+            if not isinstance(intent, str) or not INTENT.fullmatch(intent) or status not in ("confirmed", "active"):
+                unavailable()
+            return await self.activate_room(inviter, room_id, intent, status)
         finally:
             self.finishing_rooms.remove(room_id)
 
@@ -255,18 +291,20 @@ class TavernFlux:
         status = value.get("status")
         if status == "pending":
             return {"status": "pending"}
-        if status not in {"confirmed", "active"}:
+        if status not in ("confirmed", "active"):
             state_changed()
+        return await self.activate_room(inviter, room_id, intent, status)
+
+    async def activate_room(self, inviter, room_id, intent, status):
+        """以同房同授权的原生邀请为准，确认成功但未返回时不重复发邀请。"""
         events = await self.room_state(room_id, inviter)
         member = events.get((EventTypes.Member, FLUX))
         membership = member.content.get("membership") if member is not None else None
-        if status == "active":
-            if membership not in (Membership.INVITE, Membership.JOIN):
-                state_changed()
-            return {"status": "active"}
         if membership in (Membership.INVITE, Membership.JOIN):
             event = await self.last_invite(member, room_id)
         else:
+            if status == "active":
+                state_changed()
             # 之前的邀请若已撤回或成员被移除，旧的超时请求不能把角色邀回房间。
             prior = await self.last_invite(member, room_id)
             if prior is not None and prior.content.get(MARKER) == intent:
@@ -275,7 +313,9 @@ class TavernFlux:
             event = await self.issue_invite(inviter, room_id, intent)
         if not self.matches_invite(event, inviter, room_id, intent):
             state_changed()
-        activated = await self.gateway.request("POST", f"{intent_url}/activate", {
+        if status == "active":
+            return {"status": "active"}
+        activated = await self.gateway.request("POST", f"{INTENTS}/{intent}/activate", {
             "room_id": room_id, "inviter_mxid": inviter, "invite_event_id": event.event_id,
         })
         if activated.get("status") != "active":
