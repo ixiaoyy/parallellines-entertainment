@@ -27,13 +27,16 @@
 | --- | --- |
 | `upstream.lock.json` | 官方组件版本、源码提交、不可变镜像及核对层级 |
 | `compose.yaml` | 独立 Element、Synapse、PostgreSQL；应用仅映射服务器回环，数据库无宿主端口 |
-| `config/element.json` | 固定本实例 homeserver，并启用原生 SSO 自动跳转，不改主题或设备验证 |
+| `config/element.json` | 固定本实例 homeserver、启用原生 SSO 自动跳转，并将认证页风景背景换为纯色；保留原生密钥和设备验证 |
+| `deploy/element-appearance.py` | 精确发布或回退认证页背景；不重启容器或回退主站登录 |
 | `config/synapse-public.yaml` | 必要原生非秘密配置及主站 OIDC；不含运行密钥，不可单独启动 |
 | `docs/OPERATIONS.md` | 原生生成、私有配置、生产验收与停止恢复契约 |
 | `docs/MAIN_SITE_LOGIN.md` | 单一登录、账号与权限边界、固定发布和回退 |
 | `NOTICE.md` | 上游来源和许可证说明 |
 
 生产根固定为 `/data/services/parallellines-entertainment`。所有运行凭据、signing key、媒体和数据库均留在其私有 `runtime/` / `data/` 内，不能随源码发布。
+
+已有实例只改背景时，由获准的服务器操作者把同一已审提交的 `deploy/element-appearance.py` 与 `config/element.json` 放入同一私有发布目录，保留相对路径，以 root 执行 `python3 -B deploy/element-appearance.py apply`。动作同时同步 Element 实际提供的副本和已有 SSO 恢复登记，最终核公网配置。恢复只执行同目录的 `python3 -B deploy/element-appearance.py rollback`，保留登录、账号、加密与房间权限；意外中断先用同一入口续做或回退，拒绝覆盖未知变动。
 
 ## 已部署首期的原生使用
 
