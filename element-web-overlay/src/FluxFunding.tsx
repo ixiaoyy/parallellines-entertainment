@@ -6,36 +6,13 @@ import Modal from "../../Modal";
 import BaseDialog from "../../components/views/dialogs/BaseDialog";
 import AccessibleButton from "../../components/views/elements/AccessibleButton";
 import { getCurrentLanguage } from "../../languageHandler";
+import { type PaidTavernRole, TAVERN_PAID_ROLES } from "./PaidRoles";
 import { isTavernClient } from "./RoomInvites";
+
+export { TAVERN_PAID_ROLES } from "./PaidRoles";
 
 const ENDPOINT = "/_synapse/client/tavern-flux/v1";
 const PAID_ROLE_INVITED = "tavern-paid-role-invited";
-
-type PaidTavernRole = Readonly<{
-    id: "flux-the-cat" | "sakana";
-    mxid: string;
-    name: string;
-    shortName: string;
-    originalCard: string;
-}>;
-
-/** 只登记服务端已接通独立付费授权的角色；名称与原卡不来自搜索结果。 */
-export const TAVERN_PAID_ROLES: readonly PaidTavernRole[] = [
-    {
-        id: "flux-the-cat",
-        mxid: "@bot_flux-the-cat:matrix.pingxingxian.space",
-        name: "Flux the Cat",
-        shortName: "Flux",
-        originalCard: "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/c4c1d8e8361afe13cbfded374f65fb65e87fcbc9/assets/character/default_FluxTheCat.png",
-    },
-    {
-        id: "sakana",
-        mxid: "@bot_sakana:matrix.pingxingxian.space",
-        name: "Sakana",
-        shortName: "Sakana",
-        originalCard: "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/e3ca170989689c6eae8b5cba8b6c49390bdbebbf/assets/character/contest_Assistant_Sakana.png",
-    },
-];
 
 /** 付费确认仅对已由服务器计费接线的角色生效；其他 Bot 仍走原生邀请。 */
 export function isPaidTavernRole(id: string): boolean {

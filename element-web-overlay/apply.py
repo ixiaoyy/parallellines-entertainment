@@ -431,6 +431,45 @@ def room_header(source):
     return relative, data
 
 
+def role_profile_header(source):
+    """只为 Tavern 的两个精确角色身份在普通资料页名称下加简介。"""
+    relative = WEB + "components/views/right_panel/user_info/UserInfoHeaderView.tsx"
+    data = source_file(source, relative)
+    data = replace_once(
+        data,
+        'import { useUserStatus } from "../../../../hooks/useUserStatus";',
+        'import { useUserStatus } from "../../../../hooks/useUserStatus";\n'
+        'import { useMatrixClientContext } from "../../../../contexts/MatrixClientContext";\n'
+        'import { TAVERN_PAID_ROLES } from "../../../../utils/tavern-invite/PaidRoles";\n'
+        'import { isTavernClient } from "../../../../utils/tavern-invite/RoomInvites";',
+        relative,
+    )
+    data = replace_once(
+        data,
+        '    const userStatus = useUserStatus(member.userId);',
+        '''    const userStatus = useUserStatus(member.userId);
+    const client = useMatrixClientContext();
+    // 精确匹配本站角色的 Matrix ID；不凭显示名判断，也不改设备验证面板。
+    const role = TAVERN_PAID_ROLES.find((candidate) => candidate.mxid === member.userId);
+    const roleDescription = role && !hideVerificationSection && isTavernClient(client)
+        ? role.profileDescription
+        : undefined;''',
+        relative,
+    )
+    data = replace_once(
+        data,
+        '                    {userStatus && <StatusTextView status={userStatus} />}',
+        '''                    {roleDescription && (
+                        <Text as="p" size="sm" weight="regular" lang="zh-CN" style={{ margin: 0, textAlign: "center" }}>
+                            {roleDescription}
+                        </Text>
+                    )}
+                    {userStatus && <StatusTextView status={userStatus} />}''',
+        relative,
+    )
+    return relative, data
+
+
 def plan(source):
     if git(source, "rev-parse", "HEAD").decode().strip() != REVISION:
         raise ValueError("Element checkout must match the locked revision")
@@ -440,9 +479,10 @@ def plan(source):
     directory = source / WEB / "utils/tavern-invite"
     if directory.exists() or directory.is_symlink():
         raise ValueError("Tavern overlay target already exists; use a fresh checkout")
-    replacements = dict([startup(source), ready_view(source), invite_dialog(source), room_header(source)])
+    replacements = dict([startup(source), ready_view(source), invite_dialog(source), room_header(source),
+                         role_profile_header(source)])
     additions = {name: (OVERLAY / "src" / name).read_text(encoding="utf-8")
-                 for name in ("pending.ts", "RoomInvites.tsx", "FluxFunding.tsx")}
+                 for name in ("pending.ts", "RoomInvites.tsx", "FluxFunding.tsx", "PaidRoles.ts")}
     return directory, replacements, additions
 
 
