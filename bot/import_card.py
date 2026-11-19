@@ -32,6 +32,7 @@ PROMPT_FIELDS = {
 PREVIEW_FIELDS = ("first_mes", "creator_notes", "creator", "character_version")
 CARD_ADDRESS = re.compile(r"\{\{\s*(char|user)\s*\}\}", re.I)
 CARD_DECIMAL = re.compile(r"(?:0|1)(?:\.[0-9]+)?")
+SAKANA_ROLE = "sakana"
 
 
 class ImportError(ValueError):
@@ -228,12 +229,15 @@ def role_config(profile, avatar, role, settings):
         # 仅解析原卡最常用的两个称呼；不执行任意宏，也不把作者说明当作提示词。
         value = card_addresses(value, name, "当前发言者")
         text.append(f"【{PROMPT_FIELDS[field]}】\n{value}")
+    if role == SAKANA_ROLE:
+        # 语言是酒馆运行规则，不改写原卡或要求角色改变原有性格和称呼。
+        text.append("【酒馆回复语言】\n当前发言者未指定其他语言时，默认用简体中文回应，保留角色设定与说话风格。")
 
     config = {
         "homeserver": {"server_name": SERVER, "url": f"https://{SERVER}"},
         "user": {
             "mxid_localpart": f"bot_{role}", "access_token": access_token, "device_id": device_id,
-            "name": name, "avatar": "/role/avatar.png" if avatar else "keep",
+            "name": name, "avatar": "/role/avatar.png" if avatar and role != SAKANA_ROLE else "keep",
             "encryption": {"recovery_passphrase": None, "recovery_reset_allowed": False},
         },
         "room": {"post_join_self_introduction_enabled": False, "catch_up_tolerance_seconds": 0},
@@ -249,7 +253,7 @@ def role_config(profile, avatar, role, settings):
         "initial_global_config": {"handler": {"text_generation": "static/role"}},
         "logging": "warn",
     }
-    if participation := profile.get("tavern_card"):
+    if role != SAKANA_ROLE and (participation := profile.get("tavern_card")):
         # 开场白和参与度由房间逻辑独立消费，不进入模型系统提示。
         config["tavern_card"] = participation
     return config
@@ -274,7 +278,8 @@ def publish_bundle(root, role, profile, avatar, settings, authorization):
                                     "version": profile["version"], "format": profile["format"],
                                     "sha256": profile["source_sha256"], "authorization": authorization}),
     }
-    if avatar is not None:
+    # Sakana 只私用原卡设定；保留 Matrix 原生默认头像，不准备任何可上传画面。
+    if avatar is not None and role != SAKANA_ROLE:
         files["avatar.png"] = avatar
     if root.absolute() != root.resolve():
         raise ImportError("私有角色目录不能经过符号链接或重解析到其他路径")

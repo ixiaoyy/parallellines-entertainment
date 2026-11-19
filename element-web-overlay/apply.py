@@ -135,19 +135,27 @@ def invite_dialog(source):
         'import CopyableText from "../elements/CopyableText";',
         'import CopyableText from "../elements/CopyableText";\n'
         'import { isTavernClient, TavernInviteControls, tavernInviteHelp } from "../../../utils/tavern-invite/RoomInvites";\n'
-        'import { inviteOtherTavernMembersLabel, isPaidTavernRole, matchesTavernFluxSearch,\n'
-        '    TAVERN_FLUX_MXID, TavernFluxFunding } from "../../../utils/tavern-invite/FluxFunding";',
+        'import { inviteOtherTavernMembersLabel, isPaidTavernRole, matchesPaidTavernRoleSearch,\n'
+        '    TAVERN_PAID_ROLES, TavernPaidRoleFunding } from "../../../utils/tavern-invite/FluxFunding";',
         relative,
     )
     data = replace_once(
         data,
         "    private inviteUsers = async (): Promise<void> => {",
-        '''    // 同一弹窗内，模型和金额完全匹配的邀请重试沿用原请求 ID。
-    private readonly fluxRequestIds = new Map<string, string>();
+        '''    // 同一弹窗内，角色、模型和金额都一致的邀请重试沿用原请求 ID。
+    private readonly paidRoleRequestIds = new Map<string, string>();
 
-    private onFluxInviteComplete = (): void => {
-        const targets = this.state.targets.filter((member) => !isPaidTavernRole(member.userId));
-        const filterText = isPaidTavernRole(this.state.filterText) ? "" : this.state.filterText;
+    private get selectedPaidRoles() {
+        if (!isRoomInvite(this.props)) return [];
+        return TAVERN_PAID_ROLES.filter((role) =>
+            role.mxid === this.state.filterText.trim() || this.state.targets.some((member) => member.userId.trim() === role.mxid)
+        );
+    }
+
+    private onPaidRoleInviteComplete = (mxid: string): void => {
+        // 一个角色启用只清除自身；同一次选择的其他角色、普通目标继续保留。
+        const targets = this.state.targets.filter((member) => member.userId.trim() !== mxid);
+        const filterText = this.state.filterText.trim() === mxid ? "" : this.state.filterText;
         if (targets.length || filterText) {
             this.setState({ targets, filterText, errorText: undefined });
         } else {
@@ -155,7 +163,7 @@ def invite_dialog(source):
         }
     };
 
-    private onFluxInviteBusyChange = (busy: boolean): void => this.setBusy(busy);
+    private onPaidRoleInviteBusyChange = (busy: boolean): void => this.setBusy(busy);
 
     private inviteUsers = async (): Promise<void> => {''',
         relative,
@@ -220,7 +228,7 @@ def invite_dialog(source):
     data = replace_once(
         data,
         "        const hasMixins = this.state.serverResultsMixin || this.state.threepidResultsMixin;",
-        "        let fluxSuggestion: Result | undefined;\n"
+        "        const paidRoleSuggestions: Result[] = [];\n"
         "        const hasMixins = this.state.serverResultsMixin || this.state.threepidResultsMixin;",
         relative,
     )
@@ -230,19 +238,22 @@ def invite_dialog(source):
         }
         const hasAdditionalMembers''',
         '''            priorityAdditionalMembers = this.state.threepidResultsMixin.filter(notAlreadyExists);
-            if (isRoomInvite(this.props) && matchesTavernFluxSearch(this.state.filterText)) {
+            if (isRoomInvite(this.props)) {
                 const client = MatrixClientPeg.safeGet();
                 const room = client.getRoom(this.props.roomId);
-                const fluxMembership = room?.getMember(TAVERN_FLUX_MXID)?.membership;
-                const result = {
-                    userId: TAVERN_FLUX_MXID,
-                    user: new DirectoryMember({ user_id: TAVERN_FLUX_MXID, display_name: "Flux the Cat" }),
-                };
-                // 目录没返回同一角色时仅补这个固定条目，不改搜索范围或产生重复结果。
-                if (room && !room.isSpaceRoom() && isTavernClient(client) &&
-                        fluxMembership !== KnownMembership.Join && fluxMembership !== KnownMembership.Invite &&
-                        !this.state.targets.some((member) => isPaidTavernRole(member.userId)) && notAlreadyExists(result)) {
-                    fluxSuggestion = result;
+                if (room && !room.isSpaceRoom() && isTavernClient(client)) {
+                    // 目录没返回时仅补命中的固定角色；已在房或已选的同一角色不重复补。
+                    for (const role of TAVERN_PAID_ROLES) {
+                        const membership = room.getMember(role.mxid)?.membership;
+                        if (!matchesPaidTavernRoleSearch(this.state.filterText, role) ||
+                                membership === KnownMembership.Join || membership === KnownMembership.Invite ||
+                                this.state.targets.some((member) => member.userId === role.mxid) ||
+                                !notAlreadyExists({ userId: role.mxid })) continue;
+                        paidRoleSuggestions.push({
+                            userId: role.mxid,
+                            user: new DirectoryMember({ user_id: role.mxid, display_name: role.name }),
+                        });
+                    }
                 }
             }
         }
@@ -252,13 +263,13 @@ def invite_dialog(source):
     data = replace_once(
         data,
         "        const hasAdditionalMembers = priorityAdditionalMembers.length > 0 || otherAdditionalMembers.length > 0;",
-        "        const hasAdditionalMembers = !!fluxSuggestion || priorityAdditionalMembers.length > 0 || otherAdditionalMembers.length > 0;",
+        "        const hasAdditionalMembers = paidRoleSuggestions.length > 0 || priorityAdditionalMembers.length > 0 || otherAdditionalMembers.length > 0;",
         relative,
     )
     data = replace_once(
         data,
         "        sourceMembers = [...priorityAdditionalMembers, ...sourceMembers, ...otherAdditionalMembers];",
-        "        sourceMembers = [...(fluxSuggestion ? [fluxSuggestion] : []), ...priorityAdditionalMembers, ...sourceMembers, ...otherAdditionalMembers];",
+        "        sourceMembers = [...paidRoleSuggestions, ...priorityAdditionalMembers, ...sourceMembers, ...otherAdditionalMembers];",
         relative,
     )
     data = replace_once(
@@ -331,9 +342,11 @@ def invite_dialog(source):
     data = replace_once(
         data,
         "        const onGoButtonPressed = (): void => {\n",
-        '''        // 选择 Flux 即呈现明确的付费动作；混合选择另保留只处理其他成员的按钮。
+        '''        // 每个付费角色有独立的确认动作；普通成员仍用原生邀请按钮。
+        const paidRoomId = isRoomInvite(this.props) ? this.props.roomId : undefined;
         const paidFilter = isPaidTavernRole(this.state.filterText);
-        const paidSelected = isRoomInvite(this.props) && (paidFilter || this.state.targets.some((m) => isPaidTavernRole(m.userId)));
+        const paidRoles = this.selectedPaidRoles;
+        const paidSelected = paidRoles.length > 0;
         const nativeSelected = (this.state.filterText.includes("@") && !paidFilter) || this.state.targets.some((m) => !isPaidTavernRole(m.userId));
         const onGoButtonPressed = (): void => {
 ''',
@@ -362,17 +375,19 @@ def invite_dialog(source):
                         </AccessibleButton>
                     )}
                 </div>
-                {paidSelected && isRoomInvite(this.props) && (
-                    <TavernFluxFunding
+                {paidRoomId && paidRoles.map((role) => (
+                    <TavernPaidRoleFunding
+                        key={role.id}
+                        role={role}
                         client={cli}
-                        roomId={this.props.roomId}
-                        eligible={!!tavernInviteRoom && !!cli.getRoom(this.props.roomId)?.hasEncryptionStateEvent()}
+                        roomId={paidRoomId}
+                        eligible={!!tavernInviteRoom && !!cli.getRoom(paidRoomId)?.hasEncryptionStateEvent()}
                         disabled={this.state.busy}
-                        requestIds={this.fluxRequestIds}
-                        onBusyChange={this.onFluxInviteBusyChange}
-                        onFinished={this.onFluxInviteComplete}
+                        requestIds={this.paidRoleRequestIds}
+                        onBusyChange={this.onPaidRoleInviteBusyChange}
+                        onFinished={this.onPaidRoleInviteComplete}
                     />
-                )}
+                ))}
                 {this.state.busy ? <InviteProgressBody /> : this.renderSuggestions()}''',
         relative,
     )
@@ -383,25 +398,34 @@ def invite_dialog(source):
         "                {tavernInviteRoom && <TavernInviteControls client={cli} roomId={tavernInviteRoom} />}\n",
         relative,
     )
+    data = replace_once(
+        data,
+        '                <div className="mx_InviteDialog_content">{this.renderMainTab()}</div>',
+        '''                {/* 原生内容区会截断；只在并列付费表单时允许纵向滚动。 */}
+                <div className="mx_InviteDialog_content" style={this.selectedPaidRoles.length > 1 ? { overflowY: "auto" } : undefined}>
+                    {this.renderMainTab()}
+                </div>''',
+        relative,
+    )
     return relative, data
 
 
 def room_header(source):
-    """把 Flux 模型入口接到真实房间标题，保留已有按钮和布局。"""
+    """把独立的付费角色模型入口接到房间标题，保留已有按钮和布局。"""
     relative = WEB + "components/views/rooms/RoomHeader/RoomHeader.tsx"
     data = source_file(source, relative)
     data = replace_once(
         data,
         'import { SDKContext } from "../../../../contexts/SDKContext.ts";',
         'import { SDKContext } from "../../../../contexts/SDKContext.ts";\n'
-        'import { TavernFluxRoomModelButton } from "../../../../utils/tavern-invite/FluxFunding";',
+        'import { TavernPaidRoleRoomModelButtons } from "../../../../utils/tavern-invite/FluxFunding";',
         relative,
     )
     data = replace_once(
         data,
         '            {extraButtons}\n',
         '            {extraButtons}\n'
-        '            {sdkContext.client && <TavernFluxRoomModelButton client={sdkContext.client} room={room} />}\n',
+        '            {sdkContext.client && <TavernPaidRoleRoomModelButtons client={sdkContext.client} room={room} />}\n',
         relative,
     )
     return relative, data

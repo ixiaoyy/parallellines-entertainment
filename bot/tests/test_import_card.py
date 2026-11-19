@@ -148,6 +148,30 @@ class ImportCardTest(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual((path / "avatar.png").read_bytes(), png())
 
+    def test_sakana_is_chinese_by_default_mention_only_and_never_exports_portrait(self):
+        value = card()
+        value["data"]["extensions"] = {"talkativeness": "0.5"}
+        original = png(chunk(b"tEXt", b"chara\0" + base64.b64encode(IMPORTER.json_bytes(value))))
+        profile, image = self.load("png", original)
+        before_import = IMPORTER.json_bytes(profile)
+        sakana, _ = self.prepare(profile, image, role="sakana")
+        flux, _ = self.prepare(profile, image, role="flux-the-cat")
+        conf = lambda path: json.loads((path / "config.yml").read_bytes())
+        prompt = lambda cfg: cfg["agents"]["static_definitions"][0]["config"]["text_generation"]["prompt"]
+        sakana_config, flux_config = conf(sakana), conf(flux)
+        self.assertEqual(sakana_config["user"]["mxid_localpart"], "bot_sakana")
+        self.assertEqual(sakana_config["user"]["avatar"], "keep")
+        self.assertNotIn("tavern_card", sakana_config)
+        self.assertFalse(sakana_config["room"]["post_join_self_introduction_enabled"])
+        self.assertFalse((sakana / "avatar.png").exists())
+        self.assertTrue(prompt(sakana_config).startswith(prompt(flux_config) + "\n\n"))
+        self.assertIn("未指定其他语言时，默认用简体中文", prompt(sakana_config))
+        self.assertNotIn(value["data"]["first_mes"], prompt(sakana_config))
+        self.assertEqual(flux_config["tavern_card"], {"first_message": "欢迎上船。", "talkativeness": 0.5})
+        self.assertEqual((flux / "avatar.png").read_bytes(), image)
+        self.assertEqual((self.folder / "card.png").read_bytes(), original)
+        self.assertEqual(IMPORTER.json_bytes(profile), before_import)
+
     def test_plain_png_is_rejected_without_creating_any_role(self):
         with self.assertRaisesRegex(IMPORTER.ImportError, "没有内嵌"):
             self.load("png", png())

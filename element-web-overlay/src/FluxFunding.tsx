@@ -8,20 +8,44 @@ import AccessibleButton from "../../components/views/elements/AccessibleButton";
 import { getCurrentLanguage } from "../../languageHandler";
 import { isTavernClient } from "./RoomInvites";
 
-export const TAVERN_FLUX_MXID = "@bot_flux-the-cat:matrix.pingxingxian.space";
 const ENDPOINT = "/_synapse/client/tavern-flux/v1";
-const FLUX_INVITED = "tavern-flux-invited";
-const OFFICIAL_CARD = "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/c4c1d8e8361afe13cbfded374f65fb65e87fcbc9/assets/character/default_FluxTheCat.png";
+const PAID_ROLE_INVITED = "tavern-paid-role-invited";
+
+type PaidTavernRole = Readonly<{
+    id: "flux-the-cat" | "sakana";
+    mxid: string;
+    name: string;
+    shortName: string;
+    originalCard: string;
+}>;
+
+/** 只登记服务端已接通独立付费授权的角色；名称与原卡不来自搜索结果。 */
+export const TAVERN_PAID_ROLES: readonly PaidTavernRole[] = [
+    {
+        id: "flux-the-cat",
+        mxid: "@bot_flux-the-cat:matrix.pingxingxian.space",
+        name: "Flux the Cat",
+        shortName: "Flux",
+        originalCard: "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/c4c1d8e8361afe13cbfded374f65fb65e87fcbc9/assets/character/default_FluxTheCat.png",
+    },
+    {
+        id: "sakana",
+        mxid: "@bot_sakana:matrix.pingxingxian.space",
+        name: "Sakana",
+        shortName: "Sakana",
+        originalCard: "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/e3ca170989689c6eae8b5cba8b6c49390bdbebbf/assets/character/contest_Assistant_Sakana.png",
+    },
+];
 
 /** 付费确认仅对已由服务器计费接线的角色生效；其他 Bot 仍走原生邀请。 */
 export function isPaidTavernRole(id: string): boolean {
-    return id.trim() === TAVERN_FLUX_MXID;
+    return TAVERN_PAID_ROLES.some((role) => role.mxid === id.trim());
 }
 
-/** 不扩展服务器目录；只给 Flux 的固定名称前缀和精确 MXID 提供本站搜索结果。 */
-export function matchesTavernFluxSearch(term: string): boolean {
+/** 不扩展服务器目录；只按本站付费角色名称前缀或精确 MXID 补充结果。 */
+export function matchesPaidTavernRoleSearch(term: string, role: PaidTavernRole): boolean {
     const query = term.trim().toLowerCase();
-    return query === TAVERN_FLUX_MXID || (query.length > 0 && "flux the cat".startsWith(query));
+    return query === role.mxid || (query.length > 0 && role.name.toLowerCase().startsWith(query));
 }
 
 function translated(zh: string, en: string): string {
@@ -46,20 +70,20 @@ function errorCode(error: unknown): unknown {
     return typeof error === "object" && error !== null && "errcode" in error ? error.errcode : undefined;
 }
 
-function inviteErrorMessage(error: unknown): string {
+function inviteErrorMessage(error: unknown, name: string): string {
     switch (errorCode(error)) {
         case "M_TAVERN_FLUX_LIMIT_INVALID":
         case "M_INVALID_PARAM":
             return translated("无法使用这个美元上限。请核对金额后再试。", "This USD limit is not available. Check the amount and try again.");
         case "M_TAVERN_FLUX_WALLET_UNAVAILABLE":
-            return translated("没有找到你的主站账号绑定的可用 New API 钱包。未启用 Flux。", "No available New API wallet is linked to your account. Flux was not activated.");
+            return translated(`没有找到你的主站账号绑定的可用 New API 钱包。未启用 ${name}。`, `No available New API wallet is linked to your account. ${name} was not activated.`);
         case "M_TAVERN_FLUX_MODEL_UNAVAILABLE":
             return translated("所选模型暂不可用。请选择其他模型。", "This model is not available right now. Choose another model.");
         case "M_TAVERN_FLUX_FORBIDDEN":
         case "M_TAVERN_INVITE_FORBIDDEN":
-            return translated("无法在此房间邀请 Flux。请核对账号、房间加密状态和邀请权限。", "Unable to invite Flux to this room. Check your account, room encryption, and invite permissions.");
+            return translated(`无法在此房间邀请 ${name}。请核对账号、房间加密状态和邀请权限。`, `Unable to invite ${name} to this room. Check your account, room encryption, and invite permissions.`);
         case "M_TAVERN_FLUX_STATE_CHANGED":
-            return translated("房间的 Flux 授权已变化，或 Flux 已启用。请回房间查看。", "The room’s Flux authorization changed, or Flux is already active. Check the room.");
+            return translated(`房间的 ${name} 授权已变化，或 ${name} 已启用。请回房间查看。`, `The room’s ${name} authorization changed, or ${name} is already active. Check the room.`);
         case "M_LIMIT_EXCEEDED":
             return translated("邀请过于频繁，请稍后使用同一模型和上限重试。", "Too many invitations. Wait and retry with the same model and limit.");
         case "M_TAVERN_FLUX_GATEWAY_UNAVAILABLE":
@@ -75,15 +99,17 @@ function currentClient(client: MatrixClient): boolean {
     return MatrixClientPeg.get() === client && isTavernClient(client);
 }
 
-/** 所有模型操作沿用当前 Matrix 会话，只发送到 homeserver 的 Flux 专用入口。 */
+/** 所有付费操作沿用当前 Matrix 会话；Flux 保持原请求，其他角色须显式指定。 */
 function fluxRequest<T>(
     client: MatrixClient,
+    role: PaidTavernRole,
     action: "invite" | "model-options" | "set-model",
     body: Record<string, string | number>,
     abortSignal: AbortSignal,
 ): Promise<T> {
     if (!currentClient(client)) return Promise.reject(new Error("flux_wrong_client"));
-    return client.http.authedRequest<T>(Method.Post, `${ENDPOINT}/${action}`, undefined, body,
+    return client.http.authedRequest<T>(Method.Post, `${ENDPOINT}/${action}`, undefined,
+        role.id === "flux-the-cat" ? body : { ...body, role_id: role.id },
         { prefix: "", localTimeoutMs: 15_000, abortSignal });
 }
 
@@ -98,8 +124,8 @@ function isModelOptions(value: unknown): value is ModelOptions {
         "can_edit" in value && typeof value.can_edit === "boolean";
 }
 
-/** 不沿用上一个房间或账号的结果；禁用时不查询钱包模型。 */
-function useFluxModelOptions(client: MatrixClient, roomId: string, enabled: boolean, membership?: string): {
+/** 不沿用上一个角色、房间或账号的结果；禁用时不查询钱包模型。 */
+function useFluxModelOptions(client: MatrixClient, role: PaidTavernRole, roomId: string, enabled: boolean, membership?: string): {
     data?: ModelOptions;
     error?: unknown;
     reload: () => void;
@@ -107,21 +133,21 @@ function useFluxModelOptions(client: MatrixClient, roomId: string, enabled: bool
     const [version, setVersion] = useState(0);
     const reload = useCallback(() => setVersion((value) => value + 1), []);
     const [result, setResult] = useState<{
-        client: MatrixClient; roomId: string; version: number; membership?: string; data?: ModelOptions; error?: unknown;
+        client: MatrixClient; role: PaidTavernRole; roomId: string; version: number; membership?: string; data?: ModelOptions; error?: unknown;
     }>();
     useEffect(() => {
         if (!enabled) return;
         const controller = new AbortController();
-        void fluxRequest<unknown>(client, "model-options", { room_id: roomId }, controller.signal).then((data) => {
+        void fluxRequest<unknown>(client, role, "model-options", { room_id: roomId }, controller.signal).then((data) => {
             if (!isModelOptions(data)) throw new Error("flux_invalid_model_options");
-            if (!controller.signal.aborted && currentClient(client)) setResult({ client, roomId, version, membership, data });
+            if (!controller.signal.aborted && currentClient(client)) setResult({ client, role, roomId, version, membership, data });
         }).catch((error) => {
-            if (!controller.signal.aborted && currentClient(client)) setResult({ client, roomId, version, membership, error });
+            if (!controller.signal.aborted && currentClient(client)) setResult({ client, role, roomId, version, membership, error });
         });
         return () => controller.abort();
-    }, [client, enabled, membership, roomId, version]);
+    }, [client, enabled, membership, role, roomId, version]);
 
-    const current = enabled && result?.client === client && result.roomId === roomId &&
+    const current = enabled && result?.client === client && result.role === role && result.roomId === roomId &&
         result.version === version && result.membership === membership
         ? result : undefined;
     return { data: current?.data, error: current?.error, reload };
@@ -155,9 +181,9 @@ function FluxModelPicker({ data, modelId, disabled, onChange }: {
     );
 }
 
-function FluxModelLoadStatus({ error, reload }: { error?: unknown; reload: () => void }): JSX.Element {
+function FluxModelLoadStatus({ error, name, reload }: { error?: unknown; name: string; reload: () => void }): JSX.Element {
     if (errorCode(error) === "M_TAVERN_FLUX_WALLET_UNAVAILABLE") {
-        return <p role="status">{inviteErrorMessage(error)}</p>;
+        return <p role="status">{inviteErrorMessage(error, name)}</p>;
     }
     return (
         <p role="status">
@@ -174,21 +200,22 @@ function FluxModelLoadStatus({ error, reload }: { error?: unknown; reload: () =>
 }
 
 /** 复用当前 Matrix 账号的同源鉴权；不把访问凭据发给计费站。 */
-export function TavernFluxFunding({ client, roomId, eligible, disabled, requestIds, onBusyChange, onFinished }: {
+export function TavernPaidRoleFunding({ client, role, roomId, eligible, disabled, requestIds, onBusyChange, onFinished }: {
     client: MatrixClient;
+    role: PaidTavernRole;
     roomId: string;
     eligible: boolean;
     disabled: boolean;
     requestIds: Map<string, string>;
     onBusyChange: (busy: boolean) => void;
-    onFinished: () => void;
+    onFinished: (mxid: string) => void;
 }): JSX.Element {
     const inFlight = useRef<AbortController | undefined>(undefined);
     const [busy, setBusy] = useState(false);
     const [amount, setAmount] = useState("");
     const [choice, setChoice] = useState<string | null>(null);
     const [status, setStatus] = useState("");
-    const { data: models, error: modelError, reload: reloadModels } = useFluxModelOptions(client, roomId, eligible);
+    const { data: models, error: modelError, reload: reloadModels } = useFluxModelOptions(client, role, roomId, eligible);
     const modelId = availableModel(models, choice);
     const micros = parseFluxLimitMicros(amount);
     useEffect(() => () => inFlight.current?.abort(), []);
@@ -201,24 +228,24 @@ export function TavernFluxFunding({ client, roomId, eligible, disabled, requestI
         onBusyChange(true);
         setStatus("");
         try {
-            // 同一弹窗内只有模型和金额都相同的重试复用首次操作 ID。
-            const requestKey = `${micros}:${modelId}`;
+            // 同一弹窗内，仅同一角色、模型和金额的重试复用首次操作 ID。
+            const requestKey = `${role.id}:${micros}:${modelId}`;
             let requestId = requestIds.get(requestKey);
             if (!requestId) {
                 requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
                 requestIds.set(requestKey, requestId);
             }
             const data = await fluxRequest<{ status?: string }>(
-                client, "invite", { room_id: roomId, request_id: requestId, limit_usd_micros: micros, model_id: modelId },
+                client, role, "invite", { room_id: roomId, request_id: requestId, limit_usd_micros: micros, model_id: modelId },
                 controller.signal,
             );
             if (controller.signal.aborted || !currentClient(client)) return;
             if (data.status !== "active") throw new Error("invalid_flux_invite_response");
-            window.dispatchEvent(new CustomEvent(FLUX_INVITED, { detail: roomId }));
-            onFinished();
+            window.dispatchEvent(new CustomEvent(PAID_ROLE_INVITED, { detail: { roomId, roleId: role.id } }));
+            onFinished(role.mxid);
         } catch (error) {
             if (!controller.signal.aborted && currentClient(client)) {
-                setStatus(inviteErrorMessage(error));
+                setStatus(inviteErrorMessage(error, role.shortName));
                 if (errorCode(error) === "M_TAVERN_FLUX_MODEL_UNAVAILABLE") {
                     setChoice(modelId);
                     reloadModels();
@@ -233,16 +260,19 @@ export function TavernFluxFunding({ client, roomId, eligible, disabled, requestI
         }
     };
 
-    if (!eligible) return <p role="status">{translated("Flux 只能在有邀请权限的私密加密房间启用。", "Flux is only available in private encrypted rooms you can invite to.")}</p>;
+    if (!eligible) return <p role="status">{translated(`${role.shortName} 只能在有邀请权限的私密加密房间启用。`, `${role.shortName} is only available in private encrypted rooms you can invite to.`)}</p>;
 
     return (
-        <section aria-label="Flux the Cat" aria-busy={busy}>
-            <p>{translated("邀请和开场白免费。Flux 会主动接话；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设房间上限。",
-                           "Inviting Flux and its opening message are free. Flux can join in without a mention. Model usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate room limit.")}</p>
+        <section aria-label={role.name} aria-busy={busy}>
+            <p>{role.id === "sakana"
+                ? translated("邀请免费。只有 @Sakana 才调用模型；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设 Sakana 的房间上限。",
+                             "Inviting Sakana is free. Sakana calls the model only when mentioned. Usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate Sakana room limit.")
+                : translated("邀请和开场白免费。Flux 会主动接话；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设房间上限。",
+                             "Inviting Flux and its opening message are free. Flux can join in without a mention. Model usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate room limit.")}</p>
             {models
                 ? <FluxModelPicker data={models} modelId={modelId} disabled={busy || disabled}
                       onChange={(id) => { setChoice(id); setStatus(""); }} />
-                : <FluxModelLoadStatus error={modelError} reload={reloadModels} />}
+                : <FluxModelLoadStatus error={modelError} name={role.shortName} reload={reloadModels} />}
             <details>
                 <summary>{translated("设置可选上限（美元）", "Set an optional USD limit")}</summary>
                 <label>
@@ -253,11 +283,11 @@ export function TavernFluxFunding({ client, roomId, eligible, disabled, requestI
                 {micros === null && <p role="status">{translated("请输入非负金额，最多保留 6 位小数。", "Enter a non-negative amount with up to 6 decimal places.")}</p>}
             </details>
             <AccessibleButton kind="primary" element="button" type="button" disabled={busy || disabled || !modelId || micros === null} onClick={invite}>
-                {translated("使用我的 New API 钱包额度邀请 Flux", "Invite Flux using my New API wallet balance")}
+                {translated(`使用我的 New API 钱包额度邀请 ${role.shortName}`, `Invite ${role.shortName} using my New API wallet balance`)}
             </AccessibleButton>
             {status && <p role="status">{status}</p>}
             <p>
-                <a href={OFFICIAL_CARD} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">
+                <a href={role.originalCard} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">
                     {translated("官方下载原卡（PNG）", "Download official original card (PNG)")}
                 </a>
             </p>
@@ -265,42 +295,52 @@ export function TavernFluxFunding({ client, roomId, eligible, disabled, requestI
     );
 }
 
+export function TavernPaidRoleRoomModelButtons({ client, room }: { client: MatrixClient; room: Room }): JSX.Element {
+    return <>{TAVERN_PAID_ROLES.map((role) =>
+        <TavernPaidRoleRoomModelButton key={role.id} client={client} room={room} role={role} />)}</>;
+}
+
 /** 房间标题中的入口只在服务端确认原付款人可修改后显示。 */
-export function TavernFluxRoomModelButton({ client, room }: { client: MatrixClient; room: Room }): JSX.Element | null {
-    const role = room.getMember(TAVERN_FLUX_MXID)?.membership;
+function TavernPaidRoleRoomModelButton({ client, room, role }: {
+    client: MatrixClient;
+    room: Room;
+    role: PaidTavernRole;
+}): JSX.Element | null {
+    const membership = room.getMember(role.mxid)?.membership;
     const eligible = currentClient(client) && !room.isSpaceRoom() && room.getMyMembership() === KnownMembership.Join &&
         room.getJoinRule() === JoinRule.Invite && room.hasEncryptionStateEvent() &&
-        (role === KnownMembership.Invite || role === KnownMembership.Join);
-    const { data, reload } = useFluxModelOptions(client, room.roomId, eligible, role);
+        (membership === KnownMembership.Invite || membership === KnownMembership.Join);
+    const { data, reload } = useFluxModelOptions(client, role, room.roomId, eligible, membership);
     useEffect(() => {
         if (!eligible) return;
-        // 原生邀请事件可能早于钱包激活；成功回执到达时重查本房，不等下一次进房。
+        // 钱包激活可能晚于成员事件；成功回执只刷新当前房间的对应角色。
         const invited = (event: Event): void => {
-            if (event instanceof CustomEvent && event.detail === room.roomId) reload();
+            if (event instanceof CustomEvent && event.detail?.roomId === room.roomId && event.detail?.roleId === role.id) reload();
         };
-        window.addEventListener(FLUX_INVITED, invited);
-        return () => window.removeEventListener(FLUX_INVITED, invited);
-    }, [eligible, reload, room.roomId]);
+        window.addEventListener(PAID_ROLE_INVITED, invited);
+        return () => window.removeEventListener(PAID_ROLE_INVITED, invited);
+    }, [eligible, reload, role.id, room.roomId]);
     if (!eligible || !data?.can_edit) return null;
 
     const open = (): void => {
         // 每次打开重新读取当前房的选择；关闭后再确认入口权限，覆盖并发撤销/过期。
-        const dialog = Modal.createDialog(TavernFluxRoomModelDialog, { client, roomId: room.roomId });
+        const dialog = Modal.createDialog(TavernPaidRoleRoomModelDialog, { client, role, roomId: room.roomId });
         void dialog.finished.then(reload);
     };
     return (
         <AccessibleButton kind="secondary" element="button" type="button" onClick={open}>
-            {translated("Flux 模型", "Flux model")}
+            {translated(`${role.shortName} 模型`, `${role.shortName} model`)}
         </AccessibleButton>
     );
 }
 
-function TavernFluxRoomModelDialog({ client, roomId, onFinished }: {
+function TavernPaidRoleRoomModelDialog({ client, role, roomId, onFinished }: {
     client: MatrixClient;
+    role: PaidTavernRole;
     roomId: string;
     onFinished: () => void;
 }): JSX.Element {
-    const { data, error, reload } = useFluxModelOptions(client, roomId, true);
+    const { data, error, reload } = useFluxModelOptions(client, role, roomId, true);
     const [choice, setChoice] = useState<string | null>(null);
     const [status, setStatus] = useState("");
     const [busy, setBusy] = useState(false);
@@ -317,7 +357,7 @@ function TavernFluxRoomModelDialog({ client, roomId, onFinished }: {
         setStatus("");
         try {
             // 传入刚看到的模型；另一个窗口已改时不得覆盖，须先刷新再另选。
-            const result = await fluxRequest<{ model_id?: string }>(client, "set-model", {
+            const result = await fluxRequest<{ model_id?: string }>(client, role, "set-model", {
                 room_id: roomId, model_id: modelId, expected_model_id: data.selected_model_id,
             }, controller.signal);
             if (controller.signal.aborted || !currentClient(client)) return;
@@ -341,7 +381,7 @@ function TavernFluxRoomModelDialog({ client, roomId, onFinished }: {
                 case "M_TAVERN_FLUX_WALLET_UNAVAILABLE":
                     setChoice(null);
                     reload();
-                    setStatus(translated("你目前无法更改此房间的 Flux 模型。", "You cannot change Flux’s model in this room right now."));
+                    setStatus(translated(`你目前无法更改此房间的 ${role.shortName} 模型。`, `You cannot change ${role.shortName}’s model in this room right now.`));
                     break;
                 default:
                     setStatus(translated("未能确认保存结果。请关闭后重新打开查看。", "Could not confirm the update. Reopen this dialog to check it."));
@@ -356,9 +396,9 @@ function TavernFluxRoomModelDialog({ client, roomId, onFinished }: {
         errorCode(error) === "M_TAVERN_INVITE_FORBIDDEN" || errorCode(error) === "M_TAVERN_FLUX_WALLET_UNAVAILABLE";
     const savedUnavailable = data?.selected_model_id && !data.options.some(({ id }) => id === data.selected_model_id);
     return (
-        <BaseDialog title={translated("Flux 模型", "Flux model")} onFinished={onFinished}>
+        <BaseDialog title={translated(`${role.shortName} 模型`, `${role.shortName} model`)} onFinished={onFinished}>
             {denied
-                ? <p role="status">{translated("只有此房间当前的付款人可以更改 Flux 模型。", "Only this room’s current payer can change Flux’s model.")}</p>
+                ? <p role="status">{translated(`只有此房间当前的付款人可以更改 ${role.shortName} 模型。`, `Only this room’s current payer can change ${role.shortName}’s model.`)}</p>
                 : data
                     ? <>
                         <p>{translated("新请求使用新模型，进行中的请求按原模型结算。本房间的费用上限和付款人不变。",
@@ -369,7 +409,7 @@ function TavernFluxRoomModelDialog({ client, roomId, onFinished }: {
                             {translated("保存模型", "Save model")}
                         </AccessibleButton>
                     </>
-                    : <FluxModelLoadStatus error={error} reload={reload} />}
+                    : <FluxModelLoadStatus error={error} name={role.shortName} reload={reload} />}
             {status && <p role="status">{status}</p>}
         </BaseDialog>
     );

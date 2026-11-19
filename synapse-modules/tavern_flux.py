@@ -1,4 +1,4 @@
-"""仅为 Flux 衔接已认证的 Matrix 邀请与 New API 的本人额度确认。"""
+"""衔接已认证的 Matrix 角色邀请与 New API 的本人额度确认。"""
 
 from __future__ import annotations
 
@@ -40,7 +40,10 @@ MODEL_OPTIONS = f"{INTENTS}/model-options"
 SET_MODEL = f"{INTENTS}/set-model"
 AUTHORIZATION_PAGE = f"{NEW_API}/tavern-flux/authorize?intent_id="
 OIDC_PROVIDER = "oidc-parallellines"
+FLUX_ROLE = "flux-the-cat"
 FLUX = f"@bot_flux-the-cat:{HOMESERVER}"
+ROLES = {FLUX_ROLE: FLUX, "sakana": f"@bot_sakana:{HOMESERVER}"}
+ROLE_TARGETS = frozenset(ROLES.values())
 MARKER = "space.pingxingxian.tavern_flux_intent"
 ISSUE_NONCE = "space.pingxingxian.tavern_flux_issue"
 KEY_FILE = Path("/data/tavern-flux-issuer-key")
@@ -79,9 +82,22 @@ def private_encrypted_chat(events):
     )
 
 
-def private_encrypted_room(events, inviter):
+def private_encrypted_room(events, inviter, target=FLUX):
     """新邀请必须同时通过房间性质和原生邀请权限；其他 Bot 不走本判断。"""
-    return private_encrypted_chat(events) and invite_allowed(events, inviter, FLUX)
+    return private_encrypted_chat(events) and invite_allowed(events, inviter, target)
+
+
+def requested_role(body):
+    """旧客户端不发角色字段，仍只代表 Flux；不接受任意 Matrix 目标。"""
+    role = body.get("role_id", FLUX_ROLE)
+    if not isinstance(role, str) or role not in ROLES:
+        reject(400, "M_INVALID_PARAM")
+    return role
+
+
+def gateway_role(role):
+    """保持旧 Flux 的签发输入，新角色必须显式传递。"""
+    return {} if role == FLUX_ROLE else {"role_id": role}
 
 
 def model_id_valid(value):
@@ -177,7 +193,7 @@ class FluxGateway:
 
 
 class TavernFlux:
-    """私密加密房内为固定 Flux 角色发起额度授权，不修改其他邀请入口。"""
+    """私密加密房内按固定角色分别发起额度授权，不修改其他邀请入口。"""
 
     active_local_user = TavernInvites.active_local_user
     authenticate = TavernInvites.authenticate
@@ -209,15 +225,15 @@ class TavernFlux:
         api.register_third_party_rules_callbacks(check_event_allowed=self.check_flux_invite)
 
     async def check_flux_invite(self, event, state):
-        """Flux 只接受本次签发中的已确认邀请，普通成员及其他角色不受影响。"""
-        if (event.type == EventTypes.Member and event.state_key == FLUX
+        """付费角色只接受本次签发中目标明确的邀请，普通成员及其他角色不受影响。"""
+        if (event.type == EventTypes.Member and event.state_key in ROLE_TARGETS
                 and event.content.get("membership") == Membership.INVITE):
             marker = event.content.get(MARKER)
             nonce = event.content.get(ISSUE_NONCE)
             return bool(isinstance(marker, str) and INTENT.fullmatch(marker)
                         and isinstance(nonce, str) and NONCE.fullmatch(nonce)
-                        and (event.room_id, event.sender, marker, nonce) in self.issuing_invites
-                        and private_encrypted_room(state, event.sender)), None
+                        and (event.room_id, event.state_key, event.sender, marker, nonce) in self.issuing_invites
+                        and private_encrypted_room(state, event.sender, event.state_key)), None
         return True, None
 
     async def subject(self, inviter):
@@ -233,46 +249,48 @@ class TavernFlux:
             forbidden()
         return subject
 
-    async def room_events(self, room_id, inviter):
+    async def room_events(self, room_id, inviter, target=FLUX):
         """只取房间资格、邀请权及该角色成员状态所需事件。"""
         return await self.api.get_room_state(room_id, (
             (EventTypes.Create, ""), (EventTypes.JoinRules, ""), (EventTypes.RoomEncryption, ""),
             (EventTypes.PowerLevels, ""), (EventTypes.Name, ""),
-            (EventTypes.Member, inviter), (EventTypes.Member, FLUX),
+            (EventTypes.Member, inviter), (EventTypes.Member, target),
         ))
 
-    async def room_state(self, room_id, inviter):
-        """要求当前用户具备新发 Flux 邀请的房间与原生权限。"""
-        events = await self.room_events(room_id, inviter)
-        if not private_encrypted_room(events, inviter):
+    async def room_state(self, room_id, inviter, target=FLUX):
+        """要求当前用户具备在该房间新发目标角色邀请的原生权限。"""
+        events = await self.room_events(room_id, inviter, target)
+        if not private_encrypted_room(events, inviter, target):
             forbidden()
         return events
 
-    async def model_room(self, room_id, inviter, set_model=False):
-        """只有原邀请人可改已在房的 Flux；单纯查看邀请选项仍须有原生邀请权。"""
-        events = await self.room_events(room_id, inviter)
+    async def model_room(self, room_id, inviter, target=FLUX, *, set_model=False):
+        """只有该角色的原邀请人可改模型；查看未邀请角色的选项仍须有邀请权。"""
+        events = await self.room_events(room_id, inviter, target)
         sender = events.get((EventTypes.Member, inviter))
         if not private_encrypted_chat(events) or sender is None or sender.content.get("membership") != Membership.JOIN:
             forbidden()
-        member = events.get((EventTypes.Member, FLUX))
+        member = events.get((EventTypes.Member, target))
         if member is not None and member.content.get("membership") in (Membership.INVITE, Membership.JOIN):
-            event = await self.last_invite(member, room_id)
+            event = await self.last_invite(member, room_id, target)
             intent = event.content.get(MARKER) if event is not None else None
-            if not isinstance(intent, str) or not INTENT.fullmatch(intent) or not self.matches_invite(event, inviter, room_id, intent):
+            if not isinstance(intent, str) or not INTENT.fullmatch(intent) or not self.matches_invite(event, inviter, room_id, intent, target):
                 forbidden()
         elif set_model:
             state_changed()
-        elif not invite_allowed(events, inviter, FLUX):
+        elif not invite_allowed(events, inviter, target):
             forbidden()
 
     async def model_options(self, inviter, body):
         """由网关按当前付款人列出可用模型；读选项不建授权也不扣费。"""
         room_id = body.get("room_id")
-        if set(body) != {"room_id"} or not room_id_valid(room_id):
+        if set(body) - {"role_id"} != {"room_id"} or not room_id_valid(room_id):
             reject(400, "M_INVALID_PARAM")
-        await self.model_room(room_id, inviter)
+        role = requested_role(body)
+        await self.model_room(room_id, inviter, ROLES[role])
         value = await self.gateway.request("POST", MODEL_OPTIONS, {
             "room_id": room_id, "inviter_mxid": inviter, "subject": await self.subject(inviter),
+            **gateway_role(role),
         })
         options, current, editable = value.get("options"), value.get("selected_model_id"), value.get("can_edit")
         if (set(value) != {"options", "selected_model_id", "can_edit"} or not isinstance(options, list)
@@ -294,13 +312,14 @@ class TavernFlux:
     async def set_model(self, inviter, body):
         """只更改同房原授权的模型；网关负责精确钱包归属及并发检查。"""
         room_id, model_id, expected = (body.get(key) for key in ("room_id", "model_id", "expected_model_id"))
-        if (set(body) != {"room_id", "model_id", "expected_model_id"} or not room_id_valid(room_id)
+        if (set(body) - {"role_id"} != {"room_id", "model_id", "expected_model_id"} or not room_id_valid(room_id)
                 or not model_id_valid(model_id) or not model_id_valid(expected)):
             reject(400, "M_INVALID_PARAM")
-        await self.model_room(room_id, inviter, set_model=True)
+        role = requested_role(body)
+        await self.model_room(room_id, inviter, ROLES[role], set_model=True)
         value = await self.gateway.request("POST", SET_MODEL, {
             "room_id": room_id, "inviter_mxid": inviter, "subject": await self.subject(inviter),
-            "model_id": model_id, "expected_model_id": expected,
+            "model_id": model_id, "expected_model_id": expected, **gateway_role(role),
         })
         if value != {"model_id": model_id}:
             unavailable()
@@ -328,35 +347,40 @@ class TavernFlux:
         if (set(body) != {"room_id", "intent_id"} or not room_id_valid(room_id)
                 or not isinstance(intent, str) or not INTENT.fullmatch(intent)):
             reject(400, "M_INVALID_PARAM")
-        self.claim_room(room_id)
+        lock = self.claim_room(room_id, FLUX)
         try:
             return await self.finish_room(inviter, room_id, intent)
         finally:
-            self.finishing_rooms.remove(room_id)
+            self.finishing_rooms.remove(lock)
 
-    def claim_room(self, room_id):
-        """串行处理同一房间的新旧签发入口，并限制同时处理的房间数。"""
-        if room_id in self.finishing_rooms or len(self.finishing_rooms) >= MAX_ACTIVE_FINISH:
+    def claim_room(self, room_id, target):
+        """只对同一房间的同一角色串行，新旧 Flux 入口共享同一把锁。"""
+        key = (room_id, target)
+        if key in self.finishing_rooms or len(self.finishing_rooms) >= MAX_ACTIVE_FINISH:
             reject(429, "M_LIMIT_EXCEEDED")
-        self.finishing_rooms.add(room_id)
+        self.finishing_rooms.add(key)
+        return key
 
     async def invite(self, inviter, body):
         """用当前 Matrix 登录人完成一次费用确认和邀请；重试只复用同一个授权。"""
         room_id, request_id, limit = (body.get(key) for key in ("room_id", "request_id", "limit_usd_micros"))
         required = {"room_id", "request_id", "limit_usd_micros"}
-        if (set(body) not in (required, required | {"model_id"}) or not room_id_valid(room_id)
+        if (set(body) - {"model_id", "role_id"} != required or not room_id_valid(room_id)
                 or not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id)
                 or type(limit) is not int or not 0 <= limit <= MAX_SAFE_INTEGER
                 or ("model_id" in body and not model_id_valid(body["model_id"]))):
             reject(400, "M_INVALID_PARAM")
-        self.claim_room(room_id)
+        role = requested_role(body)
+        target = ROLES[role]
+        lock = self.claim_room(room_id, target)
         try:
             subject = await self.subject(inviter)
-            events = await self.room_state(room_id, inviter)
+            events = await self.room_state(room_id, inviter, target)
             # 只传原生账号映射和已确认的费用选项；0 不设房间金额上限，钱包扣费仍由网关限制。
             request = {
                 "room_id": room_id, "inviter_mxid": inviter, "subject": subject,
                 "room_label": room_label(events, room_id), "request_id": request_id, "limit_usd_micros": limit,
+                **gateway_role(role),
             }
             if "model_id" in body:
                 request["model_id"] = body["model_id"]
@@ -364,9 +388,9 @@ class TavernFlux:
             intent, status = value.get("intent_id"), value.get("status")
             if not isinstance(intent, str) or not INTENT.fullmatch(intent) or status not in ("confirmed", "active"):
                 unavailable()
-            return await self.activate_room(inviter, room_id, intent, status)
+            return await self.activate_room(inviter, room_id, intent, status, role)
         finally:
-            self.finishing_rooms.remove(room_id)
+            self.finishing_rooms.remove(lock)
 
     async def finish_room(self, inviter, room_id, intent):
         """只以匹配的原生事件结单，断线重试能对账已发送或已经被 Bot 接受的邀请。"""
@@ -375,7 +399,8 @@ class TavernFlux:
         intent_url = f"{INTENTS}/{intent}"
         value = await self.gateway.request("GET", intent_url)
         if (value.get("intent_id") != intent or value.get("room_id") != room_id
-                or value.get("inviter_mxid") != inviter or value.get("subject") != subject):
+                or value.get("inviter_mxid") != inviter or value.get("subject") != subject
+                or value.get("role_id", FLUX_ROLE) != FLUX_ROLE):
             forbidden()
         status = value.get("status")
         if status == "pending":
@@ -384,62 +409,63 @@ class TavernFlux:
             state_changed()
         return await self.activate_room(inviter, room_id, intent, status)
 
-    async def activate_room(self, inviter, room_id, intent, status):
+    async def activate_room(self, inviter, room_id, intent, status, role=FLUX_ROLE):
         """以同房同授权的原生邀请为准，确认成功但未返回时不重复发邀请。"""
-        events = await self.room_state(room_id, inviter)
-        member = events.get((EventTypes.Member, FLUX))
+        target = ROLES[role]
+        events = await self.room_state(room_id, inviter, target)
+        member = events.get((EventTypes.Member, target))
         membership = member.content.get("membership") if member is not None else None
         if membership in (Membership.INVITE, Membership.JOIN):
-            event = await self.last_invite(member, room_id)
+            event = await self.last_invite(member, room_id, target)
         else:
             if status == "active":
                 state_changed()
             # 之前的邀请若已撤回或成员被移除，旧的超时请求不能把角色邀回房间。
-            prior = await self.last_invite(member, room_id)
+            prior = await self.last_invite(member, room_id, target)
             if prior is not None and prior.content.get(MARKER) == intent:
                 state_changed()
             await self.active_local_user(inviter)
-            event = await self.issue_invite(inviter, room_id, intent)
-        if not self.matches_invite(event, inviter, room_id, intent):
+            event = await self.issue_invite(inviter, room_id, intent, target)
+        if not self.matches_invite(event, inviter, room_id, intent, target):
             state_changed()
         if status == "active":
             return {"status": "active"}
         activated = await self.gateway.request("POST", f"{INTENTS}/{intent}/activate", {
-            "room_id": room_id, "inviter_mxid": inviter, "invite_event_id": event.event_id,
+            "room_id": room_id, "inviter_mxid": inviter, "invite_event_id": event.event_id, **gateway_role(role),
         })
         if activated.get("status") != "active":
             unavailable()
         return {"status": "active"}
 
     @staticmethod
-    def matches_invite(event, inviter, room_id, intent):
+    def matches_invite(event, inviter, room_id, intent, target=FLUX):
         """只接受固定角色、同房、同人的原生邀请事件，不接收浏览器传入 event ID。"""
         proof = event.content.get(ISSUE_NONCE) if event is not None else None
         return bool(event is not None and event.type == EventTypes.Member and event.room_id == room_id
-                    and event.sender == inviter and event.state_key == FLUX
+                    and event.sender == inviter and event.state_key == target
                     and event.content.get("membership") == Membership.INVITE
                     and event.content.get(MARKER) == intent and isinstance(proof, str) and NONCE.fullmatch(proof)
                     and EVENT_ID.fullmatch(event.event_id))
 
-    async def issue_invite(self, inviter, room_id, intent):
+    async def issue_invite(self, inviter, room_id, intent, target=FLUX):
         """已确认这一个房间的费用后，为一次原生写入开启短暂、不可重放的签发许可。"""
         nonce = secrets.token_urlsafe(32)
-        issue = (room_id, inviter, intent, nonce)
+        issue = (room_id, target, inviter, intent, nonce)
         self.issuing_invites.add(issue)
         try:
             return await self.api.update_room_membership(
-                sender=inviter, target=FLUX, room_id=room_id, new_membership=Membership.INVITE,
+                sender=inviter, target=target, room_id=room_id, new_membership=Membership.INVITE,
                 content={MARKER: intent, ISSUE_NONCE: nonce},
             )
         finally:
             self.issuing_invites.remove(issue)
 
-    async def last_invite(self, member, room_id):
+    async def last_invite(self, member, room_id, target=FLUX):
         """只沿原生成员事件替换链有限回溯，不读对话历史；链未知时拒绝再发送。"""
         if member is None:
             return None
         for _ in range(MAX_MEMBERSHIP_LOOKBACK):
-            if member is None or member.type != EventTypes.Member or member.state_key != FLUX:
+            if member is None or member.type != EventTypes.Member or member.state_key != target:
                 state_changed()
             if member.content.get("membership") == Membership.INVITE:
                 return member

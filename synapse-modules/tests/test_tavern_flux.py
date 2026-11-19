@@ -129,7 +129,9 @@ class FakeGateway:
     async def request(self, method, url, body=None):
         self.calls.append((method, url, body))
         if method == "POST" and url in (flux.MODEL_OPTIONS, flux.SET_MODEL):
-            grant = next((x for x in self.intents.values() if x["room_id"] == body["room_id"] and x["status"] == "active"), None)
+            role = body.get("role_id", flux.FLUX_ROLE)
+            grant = next((x for x in self.intents.values() if x["room_id"] == body["room_id"] and x["status"] == "active"
+                          and x.get("role_id", flux.FLUX_ROLE) == role), None)
             if grant is not None and (grant["inviter_mxid"] != body["inviter_mxid"] or grant["subject"] != body["subject"]):
                 flux.forbidden()
             if url == flux.MODEL_OPTIONS:
@@ -144,8 +146,9 @@ class FakeGateway:
             self.intents[key] = {**body, "intent_id": key, "status": "pending"}
             return {"intent_id": key, "status": "pending"}
         if method == "POST" and url == flux.ONE_CLICK_INTENT:
-            # 合成签发方只记录受信调用，同房同次请求保持同一个授权。
-            key = hashlib.sha256(json.dumps([body["room_id"], body["inviter_mxid"], body["request_id"]]).encode()).hexdigest()
+            # 同房同角色的同次请求保持一个授权，两角色不共用这个键。
+            key = hashlib.sha256(json.dumps([body["room_id"], body["inviter_mxid"], body["request_id"],
+                                             body.get("role_id", flux.FLUX_ROLE)]).encode()).hexdigest()
             entry = self.intents.setdefault(key, {**body, "intent_id": key, "status": "confirmed"})
             if (entry["subject"] != body["subject"] or entry["limit_usd_micros"] != body["limit_usd_micros"]
                     or entry["status"] not in ("confirmed", "active")):
@@ -158,6 +161,7 @@ class FakeGateway:
         if self.drop_activate:
             raise TimeoutError
         assert body["room_id"] == value["room_id"] and body["inviter_mxid"] == value["inviter_mxid"]
+        assert body.get("role_id", flux.FLUX_ROLE) == value.get("role_id", flux.FLUX_ROLE)
         value["status"] = "active"
         value["invite_event_id"] = body["invite_event_id"]
         return {"status": "active"}
@@ -171,6 +175,58 @@ class FluxContractTest(unittest.IsolatedAsyncioTestCase):
         self.module.gateway = FakeGateway()
         self.module.finishing_rooms = set()
         self.module.issuing_invites = set()
+
+    async def test_two_paid_roles_share_room_not_payer_or_model(self):
+        room = self.module.api.rooms[ROOM_A]
+        room[(flux.EventTypes.Member, BOB)] = event(flux.EventTypes.Member, ROOM_A, BOB, membership="join")
+        room[(flux.EventTypes.PowerLevels, "")] = event(flux.EventTypes.PowerLevels, ROOM_A, invite=50,
+                                                       **{ALICE: 50, BOB: 50})
+        data_a = {**self.invite_body(ROOM_A), "model_id": LUNA}
+        data_b = {**self.invite_body(ROOM_A, limit=20000), "role_id": "sakana", "model_id": TERRA}
+        async def options(user, role=None):
+            body = {"room_id": ROOM_A}
+            if role: body["role_id"] = role
+            return await self.module.model_options(user, body)
+
+        self.assertEqual(await self.module.invite(ALICE, data_a), {"status": "active"})
+        self.assertFalse((await options(BOB, "sakana"))["can_edit"])
+        self.assertEqual(await self.module.invite(BOB, data_b), {"status": "active"})
+        self.assertEqual(await self.module.invite(BOB, data_b), {"status": "active"})
+        self.assertEqual([(e.state_key, e.sender) for e in self.module.api.sent],
+                         [(flux.FLUX, ALICE), (flux.ROLES["sakana"], BOB)])
+        first, second = [self.module.gateway.intents[e.content[flux.MARKER]] for e in self.module.api.sent]
+        self.assertEqual((first["limit_usd_micros"], second["limit_usd_micros"]), (0, 20000))
+        both_same_room = {"room_id": ROOM_A, "role_id": "sakana", "model_id": LUNA, "expected_model_id": TERRA}
+        with self.assertRaises(invites.InviteError) as wrong_payer:
+            await self.module.set_model(ALICE, both_same_room)
+        self.assertEqual(wrong_payer.exception.status, 403)
+        self.assertEqual(await self.module.set_model(BOB, both_same_room), {"model_id": LUNA})
+        self.assertEqual((await options(ALICE))["selected_model_id"], LUNA)
+        second["status"] = "revoked"
+        self.assertTrue((await options(ALICE))["can_edit"])
+        self.assertFalse((await options(BOB, "sakana"))["can_edit"])
+        with self.assertRaises(invites.InviteError):
+            await self.module.finish(BOB, {"room_id": ROOM_A, "intent_id": second["intent_id"]})
+
+    async def test_paid_role_proof_is_bound_to_exact_target_and_rejects_invalid_role(self):
+        first, second = flux.FLUX, flux.ROLES["sakana"]
+        state = self.module.api.rooms[ROOM_A]
+        marker, nonce = "a" * 64, "b" * 43
+        invite = dict(membership="invite", **{flux.MARKER: marker, flux.ISSUE_NONCE: nonce})
+        self.module.issuing_invites.add((ROOM_A, first, ALICE, marker, nonce))
+        for target, allowed in ((first, True), (second, False)):
+            self.assertEqual(await self.module.check_flux_invite(event(flux.EventTypes.Member, ROOM_A,
+                              target, ALICE, **invite), state), (allowed, None))
+        f = self.module.claim_room(ROOM_A, first)
+        self.assertNotEqual(self.module.claim_room(ROOM_A, second), f)
+        with self.assertRaises(invites.InviteError) as busy:
+            self.module.claim_room(ROOM_A, first)
+        self.assertEqual(busy.exception.status, 429)
+        for value in (None, [], "other-paid-role", flux.ROLES["sakana"]):
+            with self.assertRaises(invites.InviteError) as invalid:
+                await self.module.invite(ALICE, {**self.invite_body(ROOM_A), "role_id": value})
+            self.assertEqual(invalid.exception.status, 400)
+        self.assertFalse(self.module.gateway.calls)
 
     async def prepare(self, user=ALICE, room=ROOM_A):
         prepared = await self.module.prepare(user, {"room_id": room})
