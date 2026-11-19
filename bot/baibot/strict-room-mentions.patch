@@ -302,25 +302,26 @@ index ffa793da238919c46603f677da40e2b69eeb9680..b2600ab3f74234d20a205cff3bc2f21f
          self.inner
              .matrix_link
 diff --git a/src/bot/mod.rs b/src/bot/mod.rs
-index 5114123c7b224383e77ce4cb2a843c652b7505dd..108f2c0142b371de7b63fc5e5ffc009f479e70e1 100644
+index 5114123c7b224383e77ce4cb2a843c652b7505dd..5d88d94f0df84b9e6b8559014c3d19e32b6d5346 100644
 --- a/src/bot/mod.rs
 +++ b/src/bot/mod.rs
-@@ -3,6 +3,9 @@ mod load_config;
+@@ -3,6 +3,10 @@ mod load_config;
  mod messaging;
  mod reacting;
  mod rooms;
 +mod tavern;
 +mod tavern_admission;
++mod tavern_output;
 +mod tavern_room;
  
  pub use implementation::Bot;
  pub use load_config::load as load_config;
 diff --git a/src/bot/tavern.rs b/src/bot/tavern.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..9b785638a71ed5c0d8840d8ee9437e1636c07686
+index 0000000000000000000000000000000000000000..7935969b406f682c09e895bb50f11a73260bc621
 --- /dev/null
 +++ b/src/bot/tavern.rs
-@@ -0,0 +1,479 @@
+@@ -0,0 +1,491 @@
 +use std::time::Duration;
 +
 +use chrono::Utc;
@@ -354,10 +355,12 @@ index 0000000000000000000000000000000000000000..9b785638a71ed5c0d8840d8ee9437e16
 +        Admission, Decision, Trigger, ambient_has_legacy_mention, ambient_sample, gateway_notice,
 +        is_new, local_main_sender,
 +    },
++    tavern_output::visible_flux_reply,
 +    tavern_room::{eligible_invitation, joined_after},
 +};
 +
 +const MAX_MESSAGE_BYTES: usize = 4096;
++const FLUX_LOCALPART: &str = "bot_flux-the-cat";
 +const AMBIENT_LIVE_MAX_AGE_MS: i64 = 15_000;
 +const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 +const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -423,7 +426,7 @@ index 0000000000000000000000000000000000000000..9b785638a71ed5c0d8840d8ee9437e16
 +        let (first_message, talkativeness) = match &config.tavern_card {
 +            Some(card) => {
 +                anyhow::ensure!(
-+                    config.user.mxid_localpart == "bot_flux-the-cat",
++                    config.user.mxid_localpart == FLUX_LOCALPART,
 +                    "Tavern card participation is only supported for Flux"
 +                );
 +                anyhow::ensure!(
@@ -738,7 +741,17 @@ index 0000000000000000000000000000000000000000..9b785638a71ed5c0d8840d8ee9437e16
 +            let started = std::time::Instant::now();
 +            match controller.generate_text(conversation, params).await {
 +                Ok(result) if !result.text.trim().is_empty() && result.text.len() <= 16_384 => {
-+                    result.text
++                    // 只清理 Flux 即将发到群里的新回复。保留角色卡、提问、结算和原生问候。
++                    if bot.user_id().localpart() == FLUX_LOCALPART {
++                        let visible = visible_flux_reply(&result.text);
++                        if visible.is_empty() {
++                            tracing::warn!("Tavern Flux reply contained only its status panel");
++                            return Ok(());
++                        }
++                        visible.to_owned()
++                    } else {
++                        result.text
++                    }
 +                }
 +                Ok(_) => {
 +                    tracing::warn!(elapsed = ?started.elapsed(), "Tavern model returned empty or oversized text");
@@ -1040,6 +1053,154 @@ index 0000000000000000000000000000000000000000..2c02bd93971ea50629a8e96e10ec171f
 +        assert!(!is_new(now + 1, 0, 0, now));
 +        assert!(is_new(now - 1, now - 10, now - 5, now));
 +        assert!(is_new(now - MAX_EVENT_AGE_MS, 0, 0, now));
++    }
++}
+diff --git a/src/bot/tavern_output.rs b/src/bot/tavern_output.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..28816eef456f83cc24886c4b250f4a03ae6a658e
+--- /dev/null
++++ b/src/bot/tavern_output.rs
+@@ -0,0 +1,142 @@
++const FIELDS: [&str; 10] = [
++    "Name",
++    "Body",
++    "Thoughts",
++    "AffectionLevel",
++    "Mind",
++    "Hunger",
++    "Sleepiness",
++    "PatCount",
++    "Place",
++    "Recent",
++];
++
++/// 只从 Flux 模型回复末尾移除具有角色卡字段顺序的面板；普通文字和代码原样保留。
++pub(super) fn visible_flux_reply(text: &str) -> &str {
++    let mut fence: Option<(char, usize, bool, usize, usize)> = None;
++    let mut bare = None;
++    let mut pos = 0;
++    for raw in text.split_inclusive('\n') {
++        let start = pos;
++        pos += raw.len();
++        let line = raw.trim();
++        if let Some((marker, width, info)) = fence_line(line) {
++            match fence {
++                Some((open, open_width, text_fence, from, body)) => {
++                    if marker == open && width >= open_width && info.is_empty() {
++                        if text_fence
++                            && text[pos..].trim().is_empty()
++                            && is_panel(&text[body..start], true, false)
++                        {
++                            return text[..from].trim_end();
++                        }
++                        fence = None;
++                    }
++                }
++                None => {
++                    bare = None;
++                    fence = Some((marker, width, info.is_empty() || info == "text", start, pos));
++                }
++            }
++        } else if fence.is_none() && field_index(line) == Some(0) {
++            bare = Some(start);
++        }
++    }
++    // 输出在状态面板中途被截断时，仍可移除明确的顺序字段，不误删其他语言的代码块。
++    if let Some((_, _, true, from, body)) = fence {
++        if is_panel(&text[body..], true, true) {
++            return text[..from].trim_end();
++        }
++    } else if let (None, Some(from)) = (fence, bare) {
++        if is_panel(&text[from..], false, true) {
++            return text[..from].trim_end();
++        }
++    }
++    text
++}
++
++fn fence_line(line: &str) -> Option<(char, usize, &str)> {
++    let ch = line.chars().next()?;
++    if !matches!(ch, '`' | '~') {
++        return None;
++    }
++    let width = line.bytes().take_while(|&byte| byte == ch as u8).count();
++    (width >= 3).then(|| (ch, width, line[width..].trim()))
++}
++
++fn field_index(line: &str) -> Option<usize> {
++    let line = line.trim().strip_prefix("- ").unwrap_or(line.trim());
++    let (key, _) = line.split_once([':', '：'])?;
++    let key = key.trim().trim_matches('*').trim();
++    FIELDS.iter().position(|field| *field == key)
++}
++
++fn is_panel(text: &str, fenced: bool, unfinished: bool) -> bool {
++    let mut count = 0;
++    let mut last = 0;
++    for line in text.lines().filter(|line| !line.trim().is_empty()) {
++        if let Some(index) = field_index(line) {
++            if (count < 4 && index != count) || (count >= 4 && index <= last) {
++                return false;
++            }
++            last = index;
++            count += 1;
++        } else if count == 0 || (!fenced && !line.starts_with([' ', '\t'])) {
++            return false;
++        }
++    }
++    // 裸露或闭合面板依靠罕见的 AffectionLevel 四字段指纹；未闭合的纯文本围栏允许截断到前三项。
++    count >= 4 || (fenced && unfinished && count == 3)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const PANEL: &str = "Name: role\nBody: state\nThoughts: internal\nAffectionLevel: 10\nMind: state\nHunger: 5\nSleepiness: 0\nPatCount: 2\nPlace: room\nRecent: event";
++
++    #[test]
++    fn strips_real_fenced_suffix_and_never_sends_only_status() {
++        assert_eq!(
++            visible_flux_reply(&format!(
++                "*动作*\n\n\"对话\"\n\n\x60\x60\x60text\n{PANEL}\n\x60\x60\x60\n"
++            )),
++            "*动作*\n\n\"对话\""
++        );
++        assert_eq!(
++            visible_flux_reply(&format!("\x60\x60\x60text\n{PANEL}\n\x60\x60\x60")),
++            ""
++        );
++    }
++
++    #[test]
++    fn strips_bare_and_truncated_panels() {
++        assert_eq!(visible_flux_reply(&format!("*动作*\n{PANEL}")), "*动作*");
++        assert_eq!(
++            visible_flux_reply(
++                "对话\n\x60\x60\x60text\nName: role\nBody: state\nThoughts: partial"
++            ),
++            "对话"
++        );
++        assert_eq!(
++            visible_flux_reply(
++                "对话\r\nName：role\r\nBody：state\r\nThoughts：hidden\r\nAffectionLevel：partial"
++            ),
++            "对话"
++        );
++    }
++
++    #[test]
++    fn keeps_normal_prose_code_and_earlier_code_blocks_unchanged() {
++        let left = "*动作*\n\x60\x60\x60text\nName: other\nBody: example\nThoughts: ordinary\n\x60\x60\x60";
++        assert_eq!(visible_flux_reply(left), left);
++        assert_eq!(
++            visible_flux_reply(&format!("{left}\n\x60\x60\x60text\n{PANEL}\n\x60\x60\x60")),
++            left
++        );
++        let ordinary_code = format!("\x60\x60\x60yaml\n{PANEL}\n\x60\x60\x60");
++        assert_eq!(visible_flux_reply(&ordinary_code), ordinary_code);
++        let prose = "她翻开菜单。\nName: 食谱\nBody: 两人份\n她笑着开口。";
++        assert_eq!(visible_flux_reply(prose), prose);
 +    }
 +}
 diff --git a/src/bot/tavern_room.rs b/src/bot/tavern_room.rs
