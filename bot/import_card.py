@@ -12,6 +12,7 @@ import struct
 import sys
 import tempfile
 import zlib
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -20,6 +21,7 @@ RUNTIME = Path(__file__).resolve().parents[1] / "runtime" / "bot"
 PNG = b"\x89PNG\r\n\x1a\n"
 MAX_FILE = 8 * 1024 * 1024
 MAX_CARD = 256 * 1024
+MAX_FIRST_MESSAGE = 4096
 MAX_PIXELS = 4096 * 4096
 ROLE_ID = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}")
@@ -28,6 +30,8 @@ PROMPT_FIELDS = {
     "mes_example": "对话示例", "post_history_instructions": "角色补充说明",
 }
 PREVIEW_FIELDS = ("first_mes", "creator_notes", "creator", "character_version")
+CARD_ADDRESS = re.compile(r"\{\{\s*(char|user)\s*\}\}", re.I)
+CARD_DECIMAL = re.compile(r"(?:0|1)(?:\.[0-9]+)?")
 
 
 class ImportError(ValueError):
@@ -43,7 +47,7 @@ def read_file(path, limit):
     return raw
 
 
-def parse_object(raw):
+def parse_object(raw, *, parse_float=None):
     """解析 UTF-8 JSON 对象；同一个字段不能以不同值出现两次。"""
     def unique(pairs):
         result = dict(pairs)
@@ -52,10 +56,10 @@ def parse_object(raw):
         return result
 
     try:
-        value = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique)
+        value = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique, parse_float=parse_float)
     except ImportError:
         raise
-    except (ValueError, RecursionError):
+    except (ValueError, RecursionError, InvalidOperation):
         raise ImportError("文件不是有效的 UTF-8 JSON 对象") from None
     if not isinstance(value, dict):
         raise ImportError("文件不是 JSON 对象")
@@ -120,6 +124,36 @@ def card_text(data, field):
     return value
 
 
+def card_addresses(value, name, addressee):
+    """只替换原卡的两个称呼；其他模板字符原样保留，不解释或运行。"""
+    return CARD_ADDRESS.sub(lambda m: name if m[1].lower() == "char" else addressee, value)
+
+
+def card_participation(data, name, first_message):
+    """只传给机器人两个经审核的字段；未提供的能力不启用。"""
+    participation = {}
+    if first_message.strip():
+        # 开场白对整个房间发送，没有一名消息发言者；其余原文字节不改。
+        greeting = card_addresses(first_message, name, "你")
+        if len(greeting.encode("utf-8")) > MAX_FIRST_MESSAGE:
+            raise ImportError("角色字段 first_mes 超过 4096 UTF-8 字节")
+        participation["first_message"] = greeting
+
+    extensions = data.get("extensions")
+    if isinstance(extensions, dict) and "talkativeness" in extensions:
+        value = extensions["talkativeness"]
+        if isinstance(value, str) and CARD_DECIMAL.fullmatch(value):
+            value = Decimal(value)
+        if (type(value) not in (int, Decimal)
+                or isinstance(value, Decimal) and not value.is_finite() or not 0 <= value <= 1):
+            raise ImportError("角色字段 extensions.talkativeness 必须是 0 至 1 的有限数字或十进制文本")
+        amount = float(value)
+        if value > 0 and amount == 0:
+            raise ImportError("角色字段 extensions.talkativeness 太小，无法保留为非零值")
+        participation["talkativeness"] = amount
+    return participation
+
+
 def load_card(path):
     """读取一个完整 V2 原卡，不猜测 V1/V3 或普通图片的结构。"""
     if path.suffix.lower() not in (".png", ".json"):
@@ -133,7 +167,8 @@ def load_card(path):
         payload, avatar = original, None
     if len(payload) > MAX_CARD:
         raise ImportError("角色数据超过允许大小")
-    card = parse_object(payload)
+    # 在转为机器人浮点数前精确检查边界，避免 JSON 小数被舍入到 0 或 1。
+    card = parse_object(payload, parse_float=Decimal)
     data = card.get("data")
     if card.get("spec") != "chara_card_v2" or card.get("spec_version") != "2.0" or not isinstance(data, dict):
         raise ImportError("只接受格式为 chara_card_v2 2.0 的角色原卡")
@@ -143,21 +178,28 @@ def load_card(path):
         raise ImportError("角色名为空、过长或含换行")
     if not any(fields[key].strip() for key in ("description", "personality", "scenario")):
         raise ImportError("原卡没有角色描述、性格或场景")
-    # 不把额外指令、世界书、脚本、扩展或图片链接默默带到现有聊天服务。
-    return {
+    participation = card_participation(data, name, fields["first_mes"])
+    # 除明确消费的字段外，不把额外指令、世界书、脚本、扩展或图片链接带到运行配置。
+    inactive = {key for key, value in data.items() if value and key not in {
+        "name", *PREVIEW_FIELDS, *PROMPT_FIELDS,
+    }}
+    extensions = data.get("extensions")
+    if isinstance(extensions, dict) and extensions.keys() == {"talkativeness"}:
+        inactive.discard("extensions")
+    profile = {
         "name": name,
         "format": "chara_card_v2 2.0",
         "version": fields["character_version"],
         "creator": fields["creator"],
         "notes": fields["creator_notes"],
-        "first_message_preview_only": fields["first_mes"],
         "prompt_fields": {key: fields[key] for key in PROMPT_FIELDS if fields[key].strip()},
-        "inactive_fields": sorted(key for key, value in data.items() if value and key not in {
-            "name", *PREVIEW_FIELDS, *PROMPT_FIELDS,
-        }),
+        "inactive_fields": sorted(inactive),
         "embedded_portrait": avatar is not None,
         "source_sha256": hashlib.sha256(original).hexdigest(),
-    }, avatar
+    }
+    if participation:
+        profile["tavern_card"] = participation
+    return profile, avatar
 
 
 def role_config(profile, avatar, role, settings):
@@ -184,8 +226,7 @@ def role_config(profile, avatar, role, settings):
     text = [f"你在群聊中扮演角色 {name}，只写该角色对当前单条消息的回应，不替其他成员发言。"]
     for field, value in profile["prompt_fields"].items():
         # 仅解析原卡最常用的两个称呼；不执行任意宏，也不把作者说明当作提示词。
-        value = re.sub(r"\{\{\s*(char|user)\s*\}\}",
-                       lambda m: name if m[1].lower() == "char" else "当前发言者", value, flags=re.I)
+        value = card_addresses(value, name, "当前发言者")
         text.append(f"【{PROMPT_FIELDS[field]}】\n{value}")
 
     config = {
@@ -208,6 +249,9 @@ def role_config(profile, avatar, role, settings):
         "initial_global_config": {"handler": {"text_generation": "static/role"}},
         "logging": "warn",
     }
+    if participation := profile.get("tavern_card"):
+        # 开场白和参与度由房间逻辑独立消费，不进入模型系统提示。
+        config["tavern_card"] = participation
     return config
 
 

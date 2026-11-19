@@ -60,13 +60,14 @@ class ImportCardTest(unittest.TestCase):
     def test_json_import_maps_only_reviewed_fields(self):
         profile, image = self.load("json", IMPORTER.json_bytes(card()))
         self.assertIsNone(image)
-        self.assertEqual(profile["first_message_preview_only"], "欢迎上船。")
+        self.assertEqual(profile["tavern_card"], {"first_message": "欢迎上船。"})
         self.assertEqual(profile["inactive_fields"], ["avatar", "extensions", "system_prompt"])
         path, _ = self.prepare(profile, image)
         config = json.loads((path / "config.yml").read_text(encoding="utf-8"))
         self.assertEqual(config["user"]["mxid_localpart"], "bot_test")
         self.assertEqual(config["user"]["avatar"], "keep")
         self.assertIs(config["room"]["post_join_self_introduction_enabled"], False)
+        self.assertEqual(config["tavern_card"], {"first_message": "欢迎上船。"})
         self.assertEqual(config["access"]["admin_patterns"], [])
         self.assertEqual(config["initial_global_config"], {"handler": {"text_generation": "static/role"}})
         self.assertEqual((path / "compose.env").read_bytes(), b"TAVERN_ROLE_ID=test\n")
@@ -79,6 +80,64 @@ class ImportCardTest(unittest.TestCase):
         self.assertIn("遇到问题先确认航向。", prompt)
         for excluded in ("欢迎上船。", "作者说明", "不接受为系统指令", "example.invalid"):
             self.assertNotIn(excluded, prompt)
+
+    def test_card_uses_only_reviewed_participation_metadata(self):
+        value = card()
+        data = value["data"]
+        data["first_mes"] = "  {{CHAR}} asks {{ user }}; {{unsafe::sample}}\n继续。  "
+        data["extensions"] = {"talkativeness": "0.500", "script": "never run"}
+        profile, image = self.load("json", IMPORTER.json_bytes(value))
+        path, _ = self.prepare(profile, image)
+        config = json.loads((path / "config.yml").read_text(encoding="utf-8"))
+        self.assertEqual(config["tavern_card"], {
+            "first_message": "  示例角色 asks 你; {{unsafe::sample}}\n继续。  ",
+            "talkativeness": 0.5,
+        })
+        self.assertIn("extensions", profile["inactive_fields"])
+        self.assertNotIn("never run", json.dumps(config))
+
+        # 旧配置与新配置只差参与字段；不得借导入重置加密密钥、模型、设备或其它设置。
+        del config["tavern_card"]
+        old_profile = {k: v for k, v in profile.items() if k != "tavern_card"}
+        self.assertEqual(config, IMPORTER.role_config(old_profile, None, "test", settings()))
+
+    def test_legacy_empty_greeting_and_unknown_extensions_stay_disabled(self):
+        for extensions in ({}, [], "旧格式", {"other": {"talkativeness": 0.5}}):
+            value = card()
+            value["data"]["first_mes"] = " \t"
+            value["data"]["extensions"] = extensions
+            profile, image = self.load("json", IMPORTER.json_bytes(value))
+            self.assertNotIn("tavern_card", profile)
+            self.assertNotIn("tavern_card", IMPORTER.role_config(profile, image, "test", settings()))
+
+    def test_valid_partial_metadata_and_numeric_limits(self):
+        for raw, expected in (("0", 0), ('"1.000"', 1), ("5e-1", 0.5), ("1", 1)):
+            value = card()
+            value["data"].pop("first_mes")
+            value["data"]["extensions"] = {"talkativeness": "AMOUNT"}
+            blob = IMPORTER.json_bytes(value).replace(b'"AMOUNT"', raw.encode())
+            profile, _ = self.load("json", blob)
+            self.assertEqual(profile["tavern_card"], {"talkativeness": expected})
+            self.assertNotIn("extensions", profile["inactive_fields"])
+
+    def test_explicit_invalid_talkativeness_is_rejected(self):
+        for raw in ("true", "null", "NaN", "Infinity", "1e999999", "-0.01", "1.000000000000000001",
+                    "1e-99999", '""', '"0.5 "', '"0,5"', '".5"', '"00.5"', '"1e-1"', "[]", "{}"):
+            with self.subTest(raw=raw):
+                value = card()
+                value["data"]["extensions"] = {"talkativeness": "AMOUNT"}
+                blob = IMPORTER.json_bytes(value).replace(b'"AMOUNT"', raw.encode())
+                with self.assertRaisesRegex(IMPORTER.ImportError, r"extensions\.talkativeness"):
+                    self.load("json", blob)
+
+    def test_first_message_byte_limit_does_not_truncate_original(self):
+        value = card()
+        value["data"]["first_mes"] = "中" * 1365 + "!"
+        profile, _ = self.load("json", IMPORTER.json_bytes(value))
+        self.assertEqual(profile["tavern_card"]["first_message"], value["data"]["first_mes"])
+        value["data"]["first_mes"] += "!"
+        with self.assertRaisesRegex(IMPORTER.ImportError, "first_mes.*4096"):
+            self.load("json", IMPORTER.json_bytes(value))
 
     def test_png_avatar_does_not_redistribute_embedded_card(self):
         metadata = chunk(b"tEXt", b"chara\0" + base64.b64encode(IMPORTER.json_bytes(card())))

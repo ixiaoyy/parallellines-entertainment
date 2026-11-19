@@ -1,5 +1,5 @@
 diff --git a/src/agent/manager.rs b/src/agent/manager.rs
-index da30fdb..1e1347f 100644
+index da30fdb29f8e13914bdf34c167b125c31aeac9e9..1e1347fea202a032835b965a5298ee5e8161a633 100644
 --- a/src/agent/manager.rs
 +++ b/src/agent/manager.rs
 @@ -31,6 +31,14 @@ impl Manager {
@@ -18,7 +18,7 @@ index da30fdb..1e1347f 100644
          &self,
          room_config_context: &RoomConfigContext,
 diff --git a/src/agent/provider/entity/text_generation/mod.rs b/src/agent/provider/entity/text_generation/mod.rs
-index c148bd5..a916861 100644
+index c148bd5816d5ced88de2524443a0f8f62f7e5a71..a916861e16ffe2d00ca95e9960e98c5e3cba54a8 100644
 --- a/src/agent/provider/entity/text_generation/mod.rs
 +++ b/src/agent/provider/entity/text_generation/mod.rs
 @@ -8,6 +8,7 @@ pub struct TextGenerationParams {
@@ -30,7 +30,7 @@ index c148bd5..a916861 100644
  
  pub struct TextGenerationResult {
 diff --git a/src/agent/provider/openai_compat/controller.rs b/src/agent/provider/openai_compat/controller.rs
-index daed2d8..ef1d71c 100644
+index daed2d8e43ec7aeb2b432b9af571d88a15978647..ef1d71c8523fe218d02d6b9e5d44aac95e2681b9 100644
 --- a/src/agent/provider/openai_compat/controller.rs
 +++ b/src/agent/provider/openai_compat/controller.rs
 @@ -38,15 +38,17 @@ pub struct Controller {
@@ -191,7 +191,7 @@ index daed2d8..ef1d71c 100644
 +    }
 +}
 diff --git a/src/agent/provider/openai_compat/mod.rs b/src/agent/provider/openai_compat/mod.rs
-index d569f97..36371be 100644
+index d569f973081db83920e8fe1c2c4cd391e16d1c40..36371bed61fd7a8d75924429b5ff66b3ab10bb3f 100644
 --- a/src/agent/provider/openai_compat/mod.rs
 +++ b/src/agent/provider/openai_compat/mod.rs
 @@ -15,6 +15,14 @@ mod wire;
@@ -223,7 +223,7 @@ index d569f97..36371be 100644
  
  pub fn default_config() -> Config {
 diff --git a/src/bot/implementation.rs b/src/bot/implementation.rs
-index ffa793d..b2600ab 100644
+index ffa793da238919c46603f677da40e2b69eeb9680..b2600ab3f74234d20a205cff3bc2f21f17144df2 100644
 --- a/src/bot/implementation.rs
 +++ b/src/bot/implementation.rs
 @@ -56,6 +56,7 @@ struct BotInner {
@@ -302,7 +302,7 @@ index ffa793d..b2600ab 100644
          self.inner
              .matrix_link
 diff --git a/src/bot/mod.rs b/src/bot/mod.rs
-index 5114123..108f2c0 100644
+index 5114123c7b224383e77ce4cb2a843c652b7505dd..108f2c0142b371de7b63fc5e5ffc009f479e70e1 100644
 --- a/src/bot/mod.rs
 +++ b/src/bot/mod.rs
 @@ -3,6 +3,9 @@ mod load_config;
@@ -317,19 +317,27 @@ index 5114123..108f2c0 100644
  pub use load_config::load as load_config;
 diff --git a/src/bot/tavern.rs b/src/bot/tavern.rs
 new file mode 100644
+index 0000000000000000000000000000000000000000..9b785638a71ed5c0d8840d8ee9437e1636c07686
 --- /dev/null
 +++ b/src/bot/tavern.rs
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,479 @@
 +use std::time::Duration;
 +
 +use chrono::Utc;
 +use mxlink::matrix_sdk::{
 +    EncryptionState, Room, RoomState,
 +    deserialized_responses::EncryptionInfo,
-+    ruma::events::room::message::{
-+        MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
-+        sanitize::remove_plain_reply_fallback,
++    ruma::{
++        OwnedTransactionId,
++        events::{
++            AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
++            room::message::{
++                MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
++                sanitize::remove_plain_reply_fallback,
++            },
++        },
 +    },
++    sync::RoomUpdates,
 +};
 +use mxlink::{CallbackError, MessageResponseType, ThreadInfo};
 +
@@ -342,16 +350,21 @@ new file mode 100644
 +
 +use super::{
 +    Bot,
-+    tavern_admission::{Admission, Decision, gateway_notice, is_new},
++    tavern_admission::{
++        Admission, Decision, Trigger, ambient_has_legacy_mention, ambient_sample, gateway_notice,
++        is_new, local_main_sender,
++    },
 +    tavern_room::{eligible_invitation, joined_after},
 +};
 +
 +const MAX_MESSAGE_BYTES: usize = 4096;
++const AMBIENT_LIVE_MAX_AGE_MS: i64 = 15_000;
 +const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 +const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
 +
 +pub(super) struct TavernPilot {
-+    invites: tokio::sync::Notify,
++    first_message: Option<String>,
++    talkativeness: f64,
 +    admission: std::sync::Mutex<Admission>,
 +    generation: tokio::sync::Mutex<()>,
 +}
@@ -407,8 +420,30 @@ new file mode 100644
 +            "Tavern pilot needs a fixed model, character prompt and 1..=1024 response tokens"
 +        );
 +
++        let (first_message, talkativeness) = match &config.tavern_card {
++            Some(card) => {
++                anyhow::ensure!(
++                    config.user.mxid_localpart == "bot_flux-the-cat",
++                    "Tavern card participation is only supported for Flux"
++                );
++                anyhow::ensure!(
++                    card.first_message.as_deref().is_none_or(|message| {
++                        !message.trim().is_empty() && message.len() <= MAX_MESSAGE_BYTES
++                    }),
++                    "Invalid Tavern card first message"
++                );
++                let talkativeness = card.talkativeness.unwrap_or(0.0);
++                anyhow::ensure!(
++                    (0.0..=1.0).contains(&talkativeness),
++                    "Invalid Tavern card talkativeness"
++                );
++                (card.first_message.clone(), talkativeness)
++            }
++            None => (None, 0.0),
++        };
 +        Ok(Self {
-+            invites: tokio::sync::Notify::new(),
++            first_message,
++            talkativeness,
 +            admission: std::sync::Mutex::default(),
 +            generation: tokio::sync::Mutex::default(),
 +        })
@@ -416,92 +451,167 @@ new file mode 100644
 +
 +    /// 复用 Matrix 原生邀请及加密消息接线，不挂载命令/反应入口。
 +    pub(super) fn attach(bot: &Bot) {
-+        use mxlink::matrix_sdk::ruma::events::room::member::{
-+            MembershipState, StrippedRoomMemberEvent,
-+        };
-+
-+        let pilot_bot = bot.clone();
-+        bot.matrix_link().client().add_event_handler(
-+            move |event: StrippedRoomMemberEvent, room: Room| async move {
-+                if &event.state_key == pilot_bot.user_id()
-+                    && event.content.membership == MembershipState::Invite
-+                    && room.state() == RoomState::Invited
-+                {
-+                    pilot_bot.tavern_pilot().invites.notify_one();
-+                }
-+            },
-+        );
-+
-+        // 统一从 SDK 的现存邀请房读取，合并批量邀请，不重建房间列表。
++        let started_at_ms = Utc::now().timestamp_millis();
++        let updates = bot.matrix_link().client().subscribe_to_all_room_updates();
 +        let pilot_bot = bot.clone();
 +        tokio::spawn(async move {
-+            pilot_bot.tavern_pilot().process_invites(&pilot_bot).await;
++            pilot_bot
++                .tavern_pilot()
++                .process_room_updates(&pilot_bot, updates, started_at_ms)
++                .await;
 +        });
-+        bot.tavern_pilot().invites.notify_one();
 +
-+        let started_at_ms = Utc::now().timestamp_millis();
 +        let pilot_bot = bot.clone();
 +        // 要求 SDK 确认本事件解密成功；不能只看房间标记，也不能接受明文伪造事件。
 +        bot.matrix_link().client().add_event_handler(
 +            move |event: OriginalSyncRoomMessageEvent,
 +                  room: Room,
 +                  crypto: Option<EncryptionInfo>| async move {
-+                if crypto.is_none() {
++                if crypto.is_none() || !is_explicit_mention(&pilot_bot, &event) {
 +                    return;
 +                }
-+                tokio::spawn(async move {
-+                    if let Err(err) = pilot_bot
-+                        .tavern_pilot()
-+                        .on_message(&pilot_bot, room, event, started_at_ms)
-+                        .await
-+                    {
-+                        tracing::warn!(?err, "Tavern actionable message failed");
-+                    }
-+                });
++                dispatch_message(&pilot_bot, room, event, started_at_ms, Trigger::Mention);
 +            },
 +        );
 +    }
 +
-+    /// 同一实例串行核对和接受原生邀请；只加入具有正面私密、加密证据的房间。
-+    /// 失败让原生成员状态负责恢复，不创建额外绑定或后台重复重试任务。
-+    async fn process_invites(&self, bot: &Bot) {
++    /// 首次同步或订阅落后后的补同步只恢复未加入的邀请，不重播问候或对旧消息主动应答。
++    async fn process_room_updates(
++        &self,
++        bot: &Bot,
++        mut updates: tokio::sync::broadcast::Receiver<RoomUpdates>,
++        started_at_ms: i64,
++    ) {
 +        let client = bot.matrix_link().client();
++        let mut live = false;
 +        loop {
-+            self.invites.notified().await;
-+            for room in client.invited_rooms() {
-+                match eligible_invitation(&room).await {
-+                    Ok(true) => {}
-+                    Ok(false) => continue,
-+                    Err(_) => {
-+                        tracing::warn!("Could not verify Tavern invite state; not joining");
-+                        continue;
-+                    }
-+                }
-+                match tokio::time::timeout(JOIN_TIMEOUT, room.join()).await {
-+                    Ok(Ok(())) => {}
-+                    Ok(Err(_)) => tracing::warn!("Tavern room join failed; native invite retained"),
-+                    Err(_) => tracing::warn!("Tavern room join result unknown"),
++            if !live {
++                for room in client.invited_rooms() {
++                    self.join_invitation(bot, room, false).await;
 +                }
 +            }
++            let changes = match updates.recv().await {
++                Ok(changes) => changes,
++                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
++                    // 跳过落后接收器的全部旧批次；新订阅首包仍按补同步处理。
++                    updates = client.subscribe_to_all_room_updates();
++                    live = false;
++                    continue;
++                }
++                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
++            };
++            if live && self.talkativeness > 0.0 {
++                for (room_id, update) in changes.joined {
++                    // 同步批次不全时不能区分缺口中的历史和新消息，不参与。
++                    if update.timeline.limited {
++                        continue;
++                    }
++                    let Some(room) = client.get_room(&room_id) else {
++                        continue;
++                    };
++                    for item in update.timeline.events {
++                        if item.encryption_info().is_none() {
++                            continue;
++                        }
++                        if let Ok(AnySyncTimelineEvent::MessageLike(
++                            AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(
++                                event,
++                            )),
++                        )) = item.raw().deserialize()
++                        {
++                            if !is_explicit_mention(bot, &event) {
++                                dispatch_message(
++                                    bot,
++                                    room.clone(),
++                                    event,
++                                    started_at_ms,
++                                    Trigger::Ambient,
++                                );
++                            }
++                        }
++                    }
++                }
++            }
++            if !changes.invited.is_empty() {
++                for room in client.invited_rooms() {
++                    let fresh_invite = live && changes.invited.contains_key(room.room_id());
++                    self.join_invitation(bot, room, fresh_invite).await;
++                }
++            }
++            live = true;
 +        }
 +    }
 +
-+    /// 只有新发的纯文本和真实提及可送模型；用原生规则去引用前缀，不回读历史。
++    /// 只加入具有正面私密、加密证据的房间；问候只在新邀请成功加入且正式状态回显后发送。
++    async fn join_invitation(&self, bot: &Bot, room: Room, live: bool) {
++        match eligible_invitation(&room).await {
++            Ok(true) => {}
++            Ok(false) => return,
++            Err(_) => {
++                tracing::warn!("Could not verify Tavern invite state; not joining");
++                return;
++            }
++        }
++        let greeting = self.first_message.as_ref().filter(|_| live).map(|message| {
++            let mut updates = bot
++                .matrix_link()
++                .client()
++                .subscribe_to_room_updates(room.room_id());
++            let lower_bound = Utc::now().timestamp_millis();
++            // 订阅先于 join，避免 Matrix 回显早于 HTTP join 结果时丢掉问候。
++            let room = room.clone();
++            let user_id = bot.user_id().to_owned();
++            let message = message.clone();
++            async move {
++                loop {
++                    if let Ok(Some((joined_ms, event_id))) = joined_after(&room, &user_id).await {
++                        if joined_ms >= lower_bound {
++                            // 同一原生入房事件用固定事务 ID；无模型、无账本、无历史查询。
++                            let transaction =
++                                OwnedTransactionId::from(format!("flux_greeting_{event_id}"));
++                            return room
++                                .send(RoomMessageEventContent::text_plain(message))
++                                .with_transaction_id(transaction)
++                                .await
++                                .is_ok();
++                        }
++                    }
++                    if updates.recv().await.is_err() {
++                        return false;
++                    }
++                }
++            }
++        });
++        match tokio::time::timeout(JOIN_TIMEOUT, room.join()).await {
++            Ok(Ok(())) => {
++                if let Some(greeting) = greeting {
++                    tokio::spawn(async move {
++                        if !matches!(
++                            tokio::time::timeout(REPLY_TIMEOUT, greeting).await,
++                            Ok(true)
++                        ) {
++                            tracing::warn!("Tavern Flux greeting not confirmed");
++                        }
++                    });
++                }
++            }
++            Ok(Err(_)) => tracing::warn!("Tavern room join failed; native invite retained"),
++            Err(_) => tracing::warn!("Tavern room join result unknown"),
++        }
++    }
++
++    /// 只有新发的纯文本可送模型；主动接话额外验证人、提及与卡内概率，不回读历史。
 +    async fn on_message(
 +        &self,
 +        bot: &Bot,
 +        room: Room,
 +        event: OriginalSyncRoomMessageEvent,
 +        started_at_ms: i64,
++        trigger: Trigger,
 +    ) -> Result<(), CallbackError> {
 +        if &event.sender == bot.user_id()
 +            || room.state() != RoomState::Joined
 +            || !matches!(room.encryption_state(), EncryptionState::Encrypted)
-+            || !event
-+                .content
-+                .mentions
-+                .as_ref()
-+                .is_some_and(|mentions| mentions.user_ids.iter().any(|user| user == bot.user_id()))
 +        {
 +            return Ok(());
 +        }
@@ -509,6 +619,26 @@ new file mode 100644
 +        let MessageType::Text(text) = &event.content.msgtype else {
 +            return Ok(());
 +        };
++        if trigger == Trigger::Ambient
++            && (text.body.len() > MAX_MESSAGE_BYTES
++                || !local_main_sender(
++                    event.sender.localpart(),
++                    event.sender.server_name() == bot.user_id().server_name(),
++                )
++                || event.content.relates_to.is_some()
++                || event
++                    .content
++                    .mentions
++                    .as_ref()
++                    .is_some_and(|m| m.room || !m.user_ids.is_empty())
++                || ambient_has_legacy_mention(
++                    &text.body,
++                    text.formatted.as_ref().map(|f| f.body.as_str()),
++                )
++                || !ambient_sample(event.event_id.as_str(), self.talkativeness))
++        {
++            return Ok(());
++        }
 +        // 回复和线程只使用本事件的新增正文，SDK 的旧客户端引用前缀不传给模型。
 +        let (body, response_type) = match &event.content.relates_to {
 +            None => (
@@ -540,11 +670,18 @@ new file mode 100644
 +        };
 +        let now = Utc::now();
 +        let now_ms = now.timestamp_millis();
++        if trigger == Trigger::Ambient
++            && now_ms.saturating_sub(timestamp_ms) > AMBIENT_LIVE_MAX_AGE_MS
++        {
++            return Ok(());
++        }
 +        // 只使用当前已加入房间的正式状态；无资格或消息早于加入、启动都不响应。
 +        let joined = joined_after(&room, bot.user_id()).await.map_err(|_| {
 +            CallbackError::Unknown("Could not read verified Tavern room state".into())
 +        })?;
-+        if joined.is_none_or(|joined_ms| !is_new(timestamp_ms, started_at_ms, joined_ms, now_ms)) {
++        if joined
++            .is_none_or(|(joined_ms, _)| !is_new(timestamp_ms, started_at_ms, joined_ms, now_ms))
++        {
 +            return Ok(());
 +        }
 +
@@ -560,9 +697,11 @@ new file mode 100644
 +                timestamp_ms,
 +                now_ms,
 +                generation.is_ok(),
++                trigger,
 +            );
 +        let (generation, notice) = match decision {
 +            Decision::Model => (generation.ok(), None),
++            _ if trigger == Trigger::Ambient => return Ok(()),
 +            Decision::RoomLimited => (None, Some("本房间调用太快，稍后再试。")),
 +            Decision::Busy => (None, Some("角色正在回复，稍后再试。")),
 +            Decision::Ignore => return Ok(()),
@@ -603,6 +742,9 @@ new file mode 100644
 +                }
 +                Ok(_) => {
 +                    tracing::warn!(elapsed = ?started.elapsed(), "Tavern model returned empty or oversized text");
++                    if trigger == Trigger::Ambient {
++                        return Ok(());
++                    }
 +                    "角色暂时无法回复。".to_owned()
 +                }
 +                Err(err) => {
@@ -610,6 +752,9 @@ new file mode 100644
 +                    let status = request_error.and_then(reqwest::Error::status);
 +                    let timeout = request_error.is_some_and(reqwest::Error::is_timeout);
 +                    tracing::warn!(elapsed = ?started.elapsed(), ?status, timeout, "Tavern model generation failed");
++                    if trigger == Trigger::Ambient {
++                        return Ok(());
++                    }
 +                    gateway_notice(status.map(|code| code.as_u16())).to_owned()
 +                }
 +            }
@@ -628,17 +773,51 @@ new file mode 100644
 +        Ok(())
 +    }
 +}
++
++fn is_explicit_mention(bot: &Bot, event: &OriginalSyncRoomMessageEvent) -> bool {
++    event
++        .content
++        .mentions
++        .as_ref()
++        .is_some_and(|mentions| mentions.user_ids.iter().any(|user| user == bot.user_id()))
++}
++
++fn dispatch_message(
++    bot: &Bot,
++    room: Room,
++    event: OriginalSyncRoomMessageEvent,
++    started_at_ms: i64,
++    trigger: Trigger,
++) {
++    let bot = bot.clone();
++    tokio::spawn(async move {
++        if let Err(err) = bot
++            .tavern_pilot()
++            .on_message(&bot, room, event, started_at_ms, trigger)
++            .await
++        {
++            tracing::warn!(?err, "Tavern actionable message failed");
++        }
++    });
++}
 diff --git a/src/bot/tavern_admission.rs b/src/bot/tavern_admission.rs
 new file mode 100644
-index 0000000..568cab4
+index 0000000000000000000000000000000000000000..2c02bd93971ea50629a8e96e10ec171f074111a4
 --- /dev/null
 +++ b/src/bot/tavern_admission.rs
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,236 @@
 +use std::collections::HashMap;
 +
 +const MAX_EVENT_AGE_MS: i64 = 120_000;
 +const MAX_SEEN_EVENTS: usize = 1024;
 +const ROOM_MODEL_COOLDOWN_MS: i64 = 10_000;
++const ROOM_AMBIENT_COOLDOWN_MS: i64 = 60_000;
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(super) enum Trigger {
++    Mention,
++    Ambient,
++}
 +
 +#[derive(Debug, PartialEq, Eq)]
 +pub(super) enum Decision {
@@ -652,6 +831,7 @@ index 0000000..568cab4
 +pub(super) struct Admission {
 +    seen: HashMap<String, i64>,
 +    room_last_call: HashMap<String, i64>,
++    room_last_ambient: HashMap<String, i64>,
 +}
 +
 +impl Admission {
@@ -664,6 +844,7 @@ index 0000000..568cab4
 +        timestamp_ms: i64,
 +        now_ms: i64,
 +        generation_available: bool,
++        trigger: Trigger,
 +    ) -> Decision {
 +        self.seen
 +            .retain(|_, event_ms| *event_ms >= now_ms - MAX_EVENT_AGE_MS);
@@ -674,6 +855,11 @@ index 0000000..568cab4
 +
 +        self.room_last_call
 +            .retain(|_, last_call_ms| now_ms - *last_call_ms < ROOM_MODEL_COOLDOWN_MS);
++        self.room_last_ambient
++            .retain(|_, last_call_ms| now_ms - *last_call_ms < ROOM_AMBIENT_COOLDOWN_MS);
++        if trigger == Trigger::Ambient && self.room_last_ambient.contains_key(room_id) {
++            return Decision::Ignore;
++        }
 +        if self.room_last_call.contains_key(room_id) {
 +            return Decision::RoomLimited;
 +        }
@@ -681,8 +867,41 @@ index 0000000..568cab4
 +            return Decision::Busy;
 +        }
 +        self.room_last_call.insert(room_id.to_owned(), now_ms);
++        if trigger == Trigger::Ambient {
++            self.room_last_ambient.insert(room_id.to_owned(), now_ms);
++        }
 +        Decision::Model
 +    }
++}
++
++/// 主站账户使用本域 `pl_<数字 subject>`；不主动响应联邦账号、技术账号或旧本地用户名。
++pub(super) fn local_main_sender(localpart: &str, local_server: bool) -> bool {
++    local_server
++        && localpart.strip_prefix("pl_").is_some_and(|subject| {
++            !subject.is_empty() && subject.bytes().all(|byte| byte.is_ascii_digit())
++        })
++}
++
++/// 没有结构化 mentions 的旧客户端也不能让角色抢答纯文本提及或 Matrix 用户链接。
++pub(super) fn ambient_has_legacy_mention(body: &str, formatted: Option<&str>) -> bool {
++    let mention = |text: &str| {
++        let text = text.to_ascii_lowercase();
++        text.contains(['@', '＠'])
++            || text.contains("%40")
++            || text.contains("&#64;")
++            || text.contains("&#x40;")
++            || text.contains("matrix:u/")
++    };
++    mention(body) || formatted.is_some_and(|html| html.len() > 16_384 || mention(html))
++}
++
++/// 对同一 Matrix 事件固定抽样：网关重放检测仍使用原事件 ID，不为主动接话造新 ID。
++pub(super) fn ambient_sample(event_id: &str, probability: f64) -> bool {
++    let hash = event_id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
++        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
++    });
++    let sample = (hash >> 11) as f64 / (1_u64 << 53) as f64;
++    sample < probability
 +}
 +
 +/// 拒绝启动、加入之前或断线补来的旧消息，也不执行未来时间的事件。
@@ -723,26 +942,93 @@ index 0000000..568cab4
 +
 +    #[test]
 +    fn rate_is_per_room_and_busy_does_not_queue_or_charge() {
++        use Trigger::Mention;
 +        let mut state = Admission::default();
 +        let a = "!a:example.com";
 +        let b = "!b:example.com";
 +        let now = 1_000_000;
-+        assert_eq!(state.decide(a, "$a1", now, now, true), Decision::Model);
 +        assert_eq!(
-+            state.decide(a, "$a2", now, now + 1, true),
++            state.decide(a, "$a1", now, now, true, Mention),
++            Decision::Model
++        );
++        assert_eq!(
++            state.decide(a, "$a2", now, now + 1, true, Mention),
 +            Decision::RoomLimited
 +        );
-+        assert_eq!(state.decide(b, "$b1", now, now + 1, false), Decision::Busy);
-+        assert_eq!(state.decide(b, "$b1", now, now + 2, true), Decision::Ignore);
-+        assert_eq!(state.decide(b, "$b2", now, now + 2, true), Decision::Model);
 +        assert_eq!(
-+            state.decide(a, "$a1", now, now + 10_000, true),
++            state.decide(b, "$b1", now, now + 1, false, Mention),
++            Decision::Busy
++        );
++        assert_eq!(
++            state.decide(b, "$b1", now, now + 2, true, Mention),
 +            Decision::Ignore
 +        );
 +        assert_eq!(
-+            state.decide(a, "$a3", now, now + 10_000, true),
++            state.decide(b, "$b2", now, now + 2, true, Mention),
 +            Decision::Model
 +        );
++        assert_eq!(
++            state.decide(a, "$a1", now, now + 10_000, true, Mention),
++            Decision::Ignore
++        );
++        assert_eq!(
++            state.decide(a, "$a3", now, now + 10_000, true, Mention),
++            Decision::Model
++        );
++    }
++
++    #[test]
++    fn ambient_waits_a_minute_per_room_without_changing_mention_limit() {
++        use Trigger::{Ambient, Mention};
++        let mut state = Admission::default();
++        let now = 1_000_000;
++        assert_eq!(
++            state.decide("a", "$a1", now, now, true, Ambient),
++            Decision::Model
++        );
++        assert_eq!(
++            state.decide("b", "$b1", now, now + 1, true, Ambient),
++            Decision::Model
++        );
++        assert_eq!(
++            state.decide("a", "$a2", now, now + 10_000, true, Ambient),
++            Decision::Ignore
++        );
++        assert_eq!(
++            state.decide("a", "$a3", now, now + 10_000, true, Mention),
++            Decision::Model
++        );
++        assert_eq!(
++            state.decide("a", "$a3", now, now + 60_000, true, Ambient),
++            Decision::Ignore
++        );
++        assert_eq!(
++            state.decide("a", "$a4", now, now + 60_000, true, Ambient),
++            Decision::Model
++        );
++    }
++
++    #[test]
++    fn only_local_main_senders_and_no_legacy_mentions() {
++        assert!(local_main_sender("pl_53", true));
++        for id in ["bot_flux-the-cat", "bot_other", "legacy", "pl_", "pl_other"] {
++            assert!(!local_main_sender(id, true));
++        }
++        assert!(!local_main_sender("pl_53", false));
++        assert!(ambient_has_legacy_mention("hi @friend", None));
++        assert!(ambient_has_legacy_mention(
++            "hi",
++            Some("<a href='matrix:u/person:domain'>hi</a>")
++        ));
++        assert!(!ambient_has_legacy_mention("hello", Some("<em>hello</em>")));
++    }
++
++    #[test]
++    fn card_probability_is_deterministic_and_preserves_endpoints() {
++        let first = ambient_sample("$matrix_event", 0.5);
++        assert_eq!(first, ambient_sample("$matrix_event", 0.5));
++        assert!(!ambient_sample("$matrix_event", 0.0));
++        assert!(ambient_sample("$matrix_event", 1.0));
 +    }
 +
 +    #[test]
@@ -758,14 +1044,15 @@ index 0000000..568cab4
 +}
 diff --git a/src/bot/tavern_room.rs b/src/bot/tavern_room.rs
 new file mode 100644
+index 0000000000000000000000000000000000000000..26df44841f19e3a3440181b1e1e4441ded5dfa64
 --- /dev/null
 +++ b/src/bot/tavern_room.rs
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,129 @@
 +use mxlink::matrix_sdk::{
 +    Room, RoomState,
 +    deserialized_responses::SyncOrStrippedState,
 +    ruma::{
-+        EventEncryptionAlgorithm, UserId,
++        EventEncryptionAlgorithm, OwnedEventId, UserId,
 +        events::{
 +            SyncStateEvent,
 +            room::{
@@ -816,7 +1103,10 @@ new file mode 100644
 +
 +/// 只读已同步的正式房间和 Bot 现有成员状态；没有资格或未加入时不交给模型。
 +/// 返回成员状态时间，用来排除加入前已存在的消息，不回读聊天事件。
-+pub(super) async fn joined_after(room: &Room, bot_mxid: &UserId) -> anyhow::Result<Option<i64>> {
++pub(super) async fn joined_after(
++    room: &Room,
++    bot_mxid: &UserId,
++) -> anyhow::Result<Option<(i64, OwnedEventId)>> {
 +    if room.state() != RoomState::Joined || !room.is_synced() {
 +        return Ok(None);
 +    }
@@ -853,7 +1143,7 @@ new file mode 100644
 +            if event.content.membership == MembershipState::Join =>
 +        {
 +            let timestamp: u64 = event.origin_server_ts.0.into();
-+            i64::try_from(timestamp).ok()
++            i64::try_from(timestamp).ok().map(|ms| (ms, event.event_id))
 +        }
 +        _ => None,
 +    })
@@ -888,7 +1178,7 @@ new file mode 100644
 +    }
 +}
 diff --git a/src/controller/chat_completion/mod.rs b/src/controller/chat_completion/mod.rs
-index 26cff41..9de7829 100644
+index 26cff4116f4053a4f05c2736b3246d7c3db9c431..9de782948895ba82e9271d65aaa3e983a6c34400 100644
 --- a/src/controller/chat_completion/mod.rs
 +++ b/src/controller/chat_completion/mod.rs
 @@ -549,6 +549,7 @@ async fn handle_stage_text_generation(
@@ -900,10 +1190,37 @@ index 26cff41..9de7829 100644
  
      // When the thinking-notice is enabled, race generation against a timer that posts and then
 diff --git a/src/entity/cfg/config.rs b/src/entity/cfg/config.rs
-index a81afec..c2c5d91 100644
+index a81afeca33b58dc2101cb0e9736cb6fd4a5dbcee..9ad419ff044d6214902c1559ea8aa7528727b8c5 100644
 --- a/src/entity/cfg/config.rs
 +++ b/src/entity/cfg/config.rs
-@@ -411,13 +411,7 @@ impl ConfigAccess {
+@@ -34,6 +34,26 @@ pub struct Config {
+ 
+     #[serde(default = "super::defaults::logging")]
+     pub logging: String,
++
++    #[serde(default)]
++    pub(crate) tavern_card: Option<TavernCardConfig>,
++}
++
++/// 只读取私有角色卡中允许用于房间的两个原生字段，不载入模板代码或自定义行为。
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++pub(crate) struct TavernCardConfig {
++    pub(crate) first_message: Option<String>,
++    pub(crate) talkativeness: Option<f64>,
++}
++
++impl std::fmt::Debug for TavernCardConfig {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("TavernCardConfig")
++            .field("has_first_message", &self.first_message.is_some())
++            .field("has_talkativeness", &self.talkativeness.is_some())
++            .finish()
++    }
+ }
+ 
+ impl Config {
+@@ -411,13 +431,7 @@ impl ConfigAccess {
      }
  
      pub fn validate(&self) -> anyhow::Result<()> {

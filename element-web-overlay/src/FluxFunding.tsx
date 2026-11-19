@@ -237,8 +237,8 @@ export function TavernFluxFunding({ client, roomId, eligible, disabled, requestI
 
     return (
         <section aria-label="Flux the Cat" aria-busy={busy}>
-            <p>{translated("邀请本身不扣费。本房间任何成员 @Flux 使用模型时，都只扣你的 New API 钱包余额，不使用订阅额度。留空或填 0 不另设房间上限。",
-                           "The invitation itself is free. Model requests from any member mentioning Flux in this room use your New API wallet balance, not subscription quota. Leave blank or enter 0 for no separate room limit.")}</p>
+            <p>{translated("邀请和开场白免费。Flux 会主动接话；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设房间上限。",
+                           "Inviting Flux and its opening message are free. Flux can join in without a mention. Model usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate room limit.")}</p>
             {models
                 ? <FluxModelPicker data={models} modelId={modelId} disabled={busy || disabled}
                       onChange={(id) => { setChoice(id); setStatus(""); }} />
