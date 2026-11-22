@@ -506,6 +506,41 @@ class FluxContractTest(unittest.IsolatedAsyncioTestCase):
             await self.finish(key)
         self.assertEqual(removed.exception.status, 409)
 
+    async def test_role_catalog_is_config_driven_and_rejects_secrets(self):
+        self.assertEqual(
+            flux.TavernFlux.parse_config({
+                "enabled": True,
+                "issuer_key_file": str(flux.KEY_FILE),
+                "paid_roles_file": str(flux.PAID_ROLES_FILE),
+            }),
+            {"paid_roles_file": str(flux.PAID_ROLES_FILE)},
+        )
+        listed = await self.module.roles_catalog(ALICE, {})
+        self.assertEqual([item["id"] for item in listed["roles"]], ["flux-the-cat", "sakana"])
+        with self.assertRaises(invites.InviteError) as extra:
+            await self.module.roles_catalog(ALICE, {"unexpected": True})
+        self.assertEqual(extra.exception.status, 400)
+
+        poisoned = [{**flux.DEFAULT_PAID_ROLES[0], "bearer_token": "should-never-exist-in-public-catalog"}]
+        with self.assertRaises(ValueError):
+            flux.validate_role_catalog(poisoned)
+
+        custom = flux.validate_role_catalog([
+            *flux.DEFAULT_PAID_ROLES,
+            {
+                "id": "turtle-soup",
+                "mxid": "@bot_turtle-soup:matrix.pingxingxian.space",
+                "name": "海龟汤裁判",
+                "shortName": "海龟汤",
+                "originalCard": "https://example.com/turtle-soup.png",
+                "profileDescription": "私密加密房内的海龟汤主持机器人。",
+                "inviteNoticeZh": "邀请免费，仅在房间内互动时扣邀请人钱包。",
+                "inviteNoticeEn": "Free to invite; usage charges only the inviter wallet.",
+            },
+        ])
+        self.assertEqual(len(custom), 3)
+        self.assertEqual(custom[2]["id"], "turtle-soup")
+
 
 if __name__ == "__main__":
     unittest.main()

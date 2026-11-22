@@ -1,0 +1,24 @@
+{
+  "roles": [
+    {
+      "id": "flux-the-cat",
+      "mxid": "@bot_flux-the-cat:matrix.pingxingxian.space",
+      "name": "Flux the Cat",
+      "shortName": "Flux",
+      "originalCard": "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/c4c1d8e8361afe13cbfded374f65fb65e87fcbc9/assets/character/default_FluxTheCat.png",
+      "profileDescription": "不会说人话的猫，只会喵叫、打呼噜，用动作表达。",
+      "inviteNoticeZh": "邀请和开场白免费。Flux 会主动接话；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设房间上限。",
+      "inviteNoticeEn": "Inviting Flux and its opening message are free. Flux can join in without a mention. Model usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate room limit."
+    },
+    {
+      "id": "sakana",
+      "mxid": "@bot_sakana:matrix.pingxingxian.space",
+      "name": "Sakana",
+      "shortName": "Sakana",
+      "originalCard": "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/e3ca170989689c6eae8b5cba8b6c49390bdbebbf/assets/character/contest_Assistant_Sakana.png",
+      "profileDescription": "爱吐槽的办公助理，默认用中文，被 @ 时才回复。",
+      "inviteNoticeZh": "邀请免费。只有 @Sakana 才调用模型；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设 Sakana 的房间上限。",
+      "inviteNoticeEn": "Inviting Sakana is free. Sakana calls the model only when mentioned. Usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate Sakana room limit."
+    }
+  ]
+}

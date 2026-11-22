@@ -6,10 +6,10 @@ import Modal from "../../Modal";
 import BaseDialog from "../../components/views/dialogs/BaseDialog";
 import AccessibleButton from "../../components/views/elements/AccessibleButton";
 import { getCurrentLanguage } from "../../languageHandler";
-import { type PaidTavernRole, TAVERN_PAID_ROLES } from "./PaidRoles";
+import { type PaidTavernRole, TAVERN_PAID_ROLES, useTavernPaidRoles } from "./PaidRoles";
 import { isTavernClient } from "./RoomInvites";
 
-export { TAVERN_PAID_ROLES } from "./PaidRoles";
+export { TAVERN_PAID_ROLES, loadTavernPaidRoles, useTavernPaidRoles } from "./PaidRoles";
 
 const ENDPOINT = "/_synapse/client/tavern-flux/v1";
 const PAID_ROLE_INVITED = "tavern-paid-role-invited";
@@ -241,11 +241,7 @@ export function TavernPaidRoleFunding({ client, role, roomId, eligible, disabled
 
     return (
         <section aria-label={role.name} aria-busy={busy}>
-            <p>{role.id === "sakana"
-                ? translated("邀请免费。只有 @Sakana 才调用模型；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设 Sakana 的房间上限。",
-                             "Inviting Sakana is free. Sakana calls the model only when mentioned. Usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate Sakana room limit.")
-                : translated("邀请和开场白免费。Flux 会主动接话；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设房间上限。",
-                             "Inviting Flux and its opening message are free. Flux can join in without a mention. Model usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate room limit.")}</p>
+            <p>{translated(role.inviteNoticeZh, role.inviteNoticeEn)}</p>
             {models
                 ? <FluxModelPicker data={models} modelId={modelId} disabled={busy || disabled}
                       onChange={(id) => { setChoice(id); setStatus(""); }} />
@@ -273,7 +269,8 @@ export function TavernPaidRoleFunding({ client, role, roomId, eligible, disabled
 }
 
 export function TavernPaidRoleRoomModelButtons({ client, room }: { client: MatrixClient; room: Room }): JSX.Element {
-    return <>{TAVERN_PAID_ROLES.map((role) =>
+    const roles = useTavernPaidRoles(currentClient(client) ? client : null);
+    return <>{roles.map((role) =>
         <TavernPaidRoleRoomModelButton key={role.id} client={client} room={room} role={role} />)}</>;
 }
 

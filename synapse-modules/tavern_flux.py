@@ -42,8 +42,37 @@ AUTHORIZATION_PAGE = f"{NEW_API}/tavern-flux/authorize?intent_id="
 OIDC_PROVIDER = "oidc-parallellines"
 FLUX_ROLE = "flux-the-cat"
 FLUX = f"@bot_flux-the-cat:{HOMESERVER}"
-ROLES = {FLUX_ROLE: FLUX, "sakana": f"@bot_sakana:{HOMESERVER}"}
+ROLE_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
+FORBIDDEN_CATALOG_KEYS = frozenset({
+    "bearer", "bearer_token", "token", "secret", "api_key", "key", "password", "credential",
+})
+DEFAULT_PAID_ROLES = (
+    {
+        "id": FLUX_ROLE,
+        "mxid": FLUX,
+        "name": "Flux the Cat",
+        "shortName": "Flux",
+        "originalCard": "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/c4c1d8e8361afe13cbfded374f65fb65e87fcbc9/assets/character/default_FluxTheCat.png",
+        "profileDescription": "不会说人话的猫，只会喵叫、打呼噜，用动作表达。",
+        "inviteNoticeZh": "邀请和开场白免费。Flux 会主动接话；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设房间上限。",
+        "inviteNoticeEn": "Inviting Flux and its opening message are free. Flux can join in without a mention. Model usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate room limit.",
+    },
+    {
+        "id": "sakana",
+        "mxid": f"@bot_sakana:{HOMESERVER}",
+        "name": "Sakana",
+        "shortName": "Sakana",
+        "originalCard": "https://raw.githubusercontent.com/SillyTavern/SillyTavern-Content/e3ca170989689c6eae8b5cba8b6c49390bdbebbf/assets/character/contest_Assistant_Sakana.png",
+        "profileDescription": "爱吐槽的办公助理，默认用中文，被 @ 时才回复。",
+        "inviteNoticeZh": "邀请免费。只有 @Sakana 才调用模型；模型用量只扣你的 New API 钱包，不用订阅额度。留空或填 0 不另设 Sakana 的房间上限。",
+        "inviteNoticeEn": "Inviting Sakana is free. Sakana calls the model only when mentioned. Usage is charged only to your New API wallet, not your subscription. Leave blank or enter 0 for no separate Sakana room limit.",
+    },
+)
+ROLES = {item["id"]: item["mxid"] for item in DEFAULT_PAID_ROLES}
 ROLE_TARGETS = frozenset(ROLES.values())
+PAID_ROLES_FILE = Path("/data/tavern-paid-roles.json")
+MAX_ROLE_CATALOG_BYTES = 32768
+MAX_PAID_ROLES = 32
 MARKER = "space.pingxingxian.tavern_flux_intent"
 ISSUE_NONCE = "space.pingxingxian.tavern_flux_issue"
 KEY_FILE = Path("/data/tavern-flux-issuer-key")
@@ -87,10 +116,58 @@ def private_encrypted_room(events, inviter, target=FLUX):
     return private_encrypted_chat(events) and invite_allowed(events, inviter, target)
 
 
-def requested_role(body):
-    """旧客户端不发角色字段，仍只代表 Flux；不接受任意 Matrix 目标。"""
+def validate_role_catalog(items):
+    """校验公开付费角色目录：只允许身份、展示与邀请说明，严禁混入任何 Bot 密钥字段。"""
+    if not isinstance(items, (list, tuple)) or not 1 <= len(items) <= MAX_PAID_ROLES:
+        raise ValueError("Tavern paid role catalog must contain 1..32 entries.")
+    required = ("id", "mxid", "name", "shortName", "originalCard", "profileDescription", "inviteNoticeZh", "inviteNoticeEn")
+    catalog = []
+    seen_ids = set()
+    seen_mxids = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid role entry.")
+        lower_keys = {str(k).lower() for k in raw}
+        if lower_keys & FORBIDDEN_CATALOG_KEYS:
+            raise ValueError("Secret fields are forbidden in the public Synapse role catalog.")
+        if set(raw) != set(required):
+            raise ValueError("Role entry keys must match the public catalog schema.")
+        role_id, mxid = raw["id"], raw["mxid"]
+        if not isinstance(role_id, str) or not ROLE_ID_RE.fullmatch(role_id) or role_id in seen_ids:
+            raise ValueError("Invalid or duplicate role_id.")
+        if not isinstance(mxid, str) or not mxid.startswith("@bot_") or not mxid.endswith(":" + HOMESERVER) or mxid in seen_mxids:
+            raise ValueError("Invalid or duplicate role mxid.")
+        for field in ("name", "shortName", "profileDescription", "inviteNoticeZh", "inviteNoticeEn"):
+            val = raw[field]
+            if not isinstance(val, str) or not 1 <= len(val) <= 512 or any(unicodedata.category(c).startswith("C") for c in val):
+                raise ValueError(f"Invalid role catalog field: {field}")
+        card = raw["originalCard"]
+        if not isinstance(card, str) or not card.startswith("https://") or len(card) > 512:
+            raise ValueError("Invalid role originalCard URL.")
+        seen_ids.add(role_id)
+        seen_mxids.add(mxid)
+        catalog.append({k: raw[k] for k in required})
+    return tuple(catalog)
+
+
+def load_paid_roles_file(path):
+    """从受控公开 JSON 文件加载角色目录，拒绝符号链接和超大文件。"""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= MAX_ROLE_CATALOG_BYTES):
+            raise ValueError("Tavern paid role catalog file is invalid.")
+        payload = json.loads(stream.read(MAX_ROLE_CATALOG_BYTES + 1).decode("utf-8"), object_pairs_hook=no_duplicate_keys)
+    if not isinstance(payload, dict) or set(payload) != {"roles"}:
+        raise ValueError("Tavern paid role catalog must be a JSON object with a single 'roles' key.")
+    return validate_role_catalog(payload["roles"])
+
+
+def requested_role(body, roles=None):
+    """旧客户端不发角色字段，仍只代表 Flux；不接受未登记的 Matrix 目标。"""
+    role_map = ROLES if roles is None else roles
     role = body.get("role_id", FLUX_ROLE)
-    if not isinstance(role, str) or role not in ROLES:
+    if not isinstance(role, str) or role not in role_map:
         reject(400, "M_INVALID_PARAM")
     return role
 
@@ -200,33 +277,52 @@ class TavernFlux:
 
     @staticmethod
     def parse_config(config):
-        """未显式启用时不注册接口；启用只允许预置的固定密钥路径。"""
+        """未显式启用时不注册接口；启用允许固定密钥路径及可选公开角色目录路径。"""
         if config == {"enabled": False} and config["enabled"] is False:
             return False
         if config == {"enabled": True, "issuer_key_file": str(KEY_FILE)} and config["enabled"] is True:
             return True
-        raise ValueError("Use the fixed Tavern Flux enablement and issuer credential file.")
+        if (config == {"enabled": True, "issuer_key_file": str(KEY_FILE), "paid_roles_file": str(PAID_ROLES_FILE)}
+                and config["enabled"] is True):
+            return {"paid_roles_file": str(PAID_ROLES_FILE)}
+        raise ValueError("Use the fixed Tavern Flux enablement, issuer credential file, and optional paid roles file.")
 
     def __init__(self, config, api):
         if config is False:
             return
-        if config is not True or synapse_version.split("+", 1)[0] != "1.165.0" or api.server_name != HOMESERVER:
+        if config is not True and config != {"paid_roles_file": str(PAID_ROLES_FILE)}:
+            raise ValueError("Tavern Flux requires the locked Synapse deployment.")
+        if synapse_version.split("+", 1)[0] != "1.165.0" or api.server_name != HOMESERVER:
             raise ValueError("Tavern Flux requires the locked Synapse deployment.")
         if (os.geteuid(), os.getegid()) != (991, 991) or api._hs.config.worker.worker_app is not None:
             raise ValueError("Tavern Flux requires the single Synapse service process.")
         self.api = api
+        self.role_catalog = (
+            load_paid_roles_file(PAID_ROLES_FILE)
+            if isinstance(config, dict) and config.get("paid_roles_file")
+            else validate_role_catalog(DEFAULT_PAID_ROLES)
+        )
+        self.roles = {item["id"]: item["mxid"] for item in self.role_catalog}
+        self.role_targets = frozenset(self.roles.values())
         self.gateway = FluxGateway(api, private_issuer_key(KEY_FILE))
         self.finishing_rooms = set()
         self.issuing_invites = set()
+        api.register_web_resource(f"{ROUTE}/roles", InviteResource(self, f"{ROUTE}/roles", "roles_catalog"))
         for action in ("prepare", "finish", "invite", "model_options", "set_model"):
             path = f"{ROUTE}/{action.replace('_', '-')}"
             # 复用固定 Element Origin、Matrix bearer、有界 JSON 及 no-store 处理。
             api.register_web_resource(path, InviteResource(self, path, action))
         api.register_third_party_rules_callbacks(check_event_allowed=self.check_flux_invite)
 
+    async def roles_catalog(self, _inviter, body):
+        """向已认证酒馆前端返回公开付费角色目录（不含任何密钥或人设正文）。"""
+        if body != {}:
+            reject(400, "M_INVALID_PARAM")
+        return {"roles": list(self.role_catalog)}
+
     async def check_flux_invite(self, event, state):
         """付费角色只接受本次签发中目标明确的邀请，普通成员及其他角色不受影响。"""
-        if (event.type == EventTypes.Member and event.state_key in ROLE_TARGETS
+        if (event.type == EventTypes.Member and event.state_key in self.role_targets
                 and event.content.get("membership") == Membership.INVITE):
             marker = event.content.get(MARKER)
             nonce = event.content.get(ISSUE_NONCE)
@@ -286,8 +382,8 @@ class TavernFlux:
         room_id = body.get("room_id")
         if set(body) - {"role_id"} != {"room_id"} or not room_id_valid(room_id):
             reject(400, "M_INVALID_PARAM")
-        role = requested_role(body)
-        await self.model_room(room_id, inviter, ROLES[role])
+        role = requested_role(body, self.roles)
+        await self.model_room(room_id, inviter, self.roles[role])
         value = await self.gateway.request("POST", MODEL_OPTIONS, {
             "room_id": room_id, "inviter_mxid": inviter, "subject": await self.subject(inviter),
             **gateway_role(role),
@@ -315,8 +411,8 @@ class TavernFlux:
         if (set(body) - {"role_id"} != {"room_id", "model_id", "expected_model_id"} or not room_id_valid(room_id)
                 or not model_id_valid(model_id) or not model_id_valid(expected)):
             reject(400, "M_INVALID_PARAM")
-        role = requested_role(body)
-        await self.model_room(room_id, inviter, ROLES[role], set_model=True)
+        role = requested_role(body, self.roles)
+        await self.model_room(room_id, inviter, self.roles[role], set_model=True)
         value = await self.gateway.request("POST", SET_MODEL, {
             "room_id": room_id, "inviter_mxid": inviter, "subject": await self.subject(inviter),
             "model_id": model_id, "expected_model_id": expected, **gateway_role(role),
@@ -370,8 +466,8 @@ class TavernFlux:
                 or type(limit) is not int or not 0 <= limit <= MAX_SAFE_INTEGER
                 or ("model_id" in body and not model_id_valid(body["model_id"]))):
             reject(400, "M_INVALID_PARAM")
-        role = requested_role(body)
-        target = ROLES[role]
+        role = requested_role(body, self.roles)
+        target = self.roles[role]
         lock = self.claim_room(room_id, target)
         try:
             subject = await self.subject(inviter)
@@ -411,7 +507,7 @@ class TavernFlux:
 
     async def activate_room(self, inviter, room_id, intent, status, role=FLUX_ROLE):
         """以同房同授权的原生邀请为准，确认成功但未返回时不重复发邀请。"""
-        target = ROLES[role]
+        target = self.roles[role]
         events = await self.room_state(room_id, inviter, target)
         member = events.get((EventTypes.Member, target))
         membership = member.content.get("membership") if member is not None else None
