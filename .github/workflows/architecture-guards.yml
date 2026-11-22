@@ -1,0 +1,28 @@
+name: Architecture Guards
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  architecture-guards:
+    name: Verify Tavern config-driven paid roles and Synapse module guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run three-way role mapping guard tests
+        run: node --test deploy/verify-role-mapping.test.mjs
+
+      - name: Run Synapse Tavern Flux module contract tests
+        run: python3 -m unittest discover -s synapse-modules/tests -p 'test_tavern_flux.py' -v
