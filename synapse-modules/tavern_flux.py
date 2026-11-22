@@ -272,6 +272,9 @@ class FluxGateway:
 class TavernFlux:
     """私密加密房内按固定角色分别发起额度授权，不修改其他邀请入口。"""
 
+    role_catalog = DEFAULT_PAID_ROLES
+    roles = ROLES
+    role_targets = ROLE_TARGETS
     active_local_user = TavernInvites.active_local_user
     authenticate = TavernInvites.authenticate
 
