@@ -1,0 +1,5 @@
+# 仅对允许签发私密邀请链接的 Synapse 实例启用，不用于首期原生初始化。
+modules:
+  - module: data.tavern_invites.TavernInvites
+    config:
+      storage_dir: /data/tavern-invites
