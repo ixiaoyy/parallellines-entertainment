@@ -470,6 +470,27 @@ def role_profile_header(source):
     return relative, data
 
 
+def space_panel(source):
+    """在左侧 SpacePanel 底部挂载轻量跨站导航入口，保留 Element 原生布局与快捷键。"""
+    relative = WEB + "components/views/spaces/SpacePanel.tsx"
+    data = source_file(source, relative)
+    data = replace_once(
+        data,
+        'import QuickSettingsButton from "./QuickSettingsButton";',
+        'import QuickSettingsButton from "./QuickSettingsButton";\n'
+        'import { TavernSiteLinks } from "../../../utils/tavern-invite/SiteLinks";',
+        relative,
+    )
+    data = replace_once(
+        data,
+        '                        <QuickSettingsButton isPanelCollapsed={isPanelCollapsed} />',
+        '                        <TavernSiteLinks isPanelCollapsed={isPanelCollapsed} client={client} />\n'
+        '                        <QuickSettingsButton isPanelCollapsed={isPanelCollapsed} />',
+        relative,
+    )
+    return relative, data
+
+
 def plan(source):
     if git(source, "rev-parse", "HEAD").decode().strip() != REVISION:
         raise ValueError("Element checkout must match the locked revision")
@@ -480,9 +501,9 @@ def plan(source):
     if directory.exists() or directory.is_symlink():
         raise ValueError("Tavern overlay target already exists; use a fresh checkout")
     replacements = dict([startup(source), ready_view(source), invite_dialog(source), room_header(source),
-                         role_profile_header(source)])
+                         role_profile_header(source), space_panel(source)])
     additions = {name: (OVERLAY / "src" / name).read_text(encoding="utf-8")
-                 for name in ("pending.ts", "RoomInvites.tsx", "FluxFunding.tsx", "PaidRoles.ts")}
+                 for name in ("pending.ts", "RoomInvites.tsx", "FluxFunding.tsx", "PaidRoles.ts", "SiteLinks.tsx")}
     return directory, replacements, additions
 
 
