@@ -68,7 +68,7 @@ def startup(source):
             message.textContent = "邀请未继续。请在允许会话存储的窗口中重新打开有效邀请。 / Invite not continued. Reopen a valid invite with session storage enabled. ";
             const back = document.createElement("a");
             back.href = "/";
-            back.textContent = "返回酒馆 / Back to Tavern";
+            back.textContent = "返回多人聊天 / Back to Group Chat";
             message.append(back);
             document.getElementById("matrixchat")?.replaceChildren(message);
         }
